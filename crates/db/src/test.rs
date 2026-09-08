@@ -222,3 +222,48 @@ async fn insert_rebalance_event_is_idempotent_on_tx_hash() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn insert_price_snapshot_allows_multiple_rows_per_asset() {
+    let pool = test_pool().await;
+    let asset_value = format!("TEST{}", Uuid::new_v4().simple());
+    let now = Utc::now();
+
+    let reflector = insert_price_snapshot(
+        &pool,
+        "other",
+        &asset_value,
+        BigDecimal::from_str("18808876553202").unwrap(),
+        "reflector",
+        Some(123_456),
+        now,
+    )
+    .await
+    .expect("insert reflector snapshot");
+    assert_eq!(reflector.source, "reflector");
+    assert_eq!(reflector.ledger_seq, Some(123_456));
+
+    // No uniqueness constraint - a second source's observation for the
+    // same asset at the same moment must not collide with the first.
+    let coingecko = insert_price_snapshot(
+        &pool,
+        "other",
+        &asset_value,
+        BigDecimal::from_str("18849700000000").unwrap(),
+        "coingecko",
+        None,
+        now,
+    )
+    .await
+    .expect("insert coingecko snapshot");
+    assert_eq!(coingecko.source, "coingecko");
+    assert!(coingecko.ledger_seq.is_none());
+    assert_ne!(reflector.id, coingecko.id);
+
+    sqlx::query("DELETE FROM price_snapshots WHERE id IN ($1, $2)")
+        .bind(reflector.id)
+        .bind(coingecko.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

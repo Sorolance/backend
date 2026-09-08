@@ -19,6 +19,7 @@
 
 pub mod chain;
 pub mod config;
+pub mod pricing;
 
 use chain::{ChainClient, ChainError};
 use chrono::Utc;

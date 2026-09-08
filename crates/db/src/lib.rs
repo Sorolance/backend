@@ -146,5 +146,38 @@ pub async fn insert_rebalance_event(
     .await
 }
 
+/// Records one price observation. Append-only (no uniqueness constraint,
+/// unlike `rebalance_events.tx_hash`) - every poll is its own row, since
+/// this is a time series, not current-state. `price` is already scaled
+/// to whatever fixed-point base the caller's source uses (Reflector's
+/// raw `i128`, or CoinGecko's USD float scaled to match it for direct
+/// comparison) - this function doesn't know or care which source it is
+/// beyond the `source` label, by design (see `rebalancer-oracle`'s crate
+/// doc comment for why the two sources are kept source-agnostic here but
+/// never blurred into one "the" price upstream).
+pub async fn insert_price_snapshot(
+    pool: &PgPool,
+    asset_kind: &str,
+    asset_value: &str,
+    price: BigDecimal,
+    source: &str,
+    ledger_seq: Option<i64>,
+    observed_at: DateTime<Utc>,
+) -> Result<PriceSnapshot, sqlx::Error> {
+    sqlx::query_as(
+        "INSERT INTO price_snapshots (asset_kind, asset_value, price, source, ledger_seq, observed_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING *",
+    )
+    .bind(asset_kind)
+    .bind(asset_value)
+    .bind(price)
+    .bind(source)
+    .bind(ledger_seq)
+    .bind(observed_at)
+    .fetch_one(pool)
+    .await
+}
+
 #[cfg(test)]
 mod test;

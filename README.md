@@ -15,23 +15,38 @@ Rust/axum backend. See `../PROJECT.md` for the full project plan.
   and typed row structs. `targets` mirrors `vault::TargetWeight` including
   the `asset`/`price_asset_*` split (the token actually held isn't always
   the same identifier the oracle prices it under - see the contracts repo
-  history). No repository/query methods yet - nothing consumes them until
-  `api`/`scheduler` exist in Phase 1, so there's no real interface to build
-  against yet.
+  history). Repository functions (`upsert_portfolio`,
+  `insert_rebalance_event`, `insert_price_snapshot`) are added as real
+  callers need them rather than guessed at ahead of time - `crates/scheduler`
+  is the first, and so far only, consumer.
+
+- `crates/oracle` (package `rebalancer-oracle`) — two independent price
+  sources: `on_chain` reads the same `oracle_adapter` (Reflector,
+  staleness-checked) the deployed `vault` itself trusts, via the `stellar`
+  CLI; `coingecko` is a wholly separate off-chain source used to
+  cross-check it. Deliberately kept as two separate clients, never merged
+  into one "the price" abstraction - see the crate doc comment for the
+  important scope note: CoinGecko is a fallback for *this backend's own
+  observability*, never something the on-chain `rebalance` decision can
+  fall back to (Soroban contracts can't reach an HTTP API).
 
 - `crates/scheduler` (package `rebalancer-scheduler`) — polls the deployed
   `vault` contract for drift on an interval and submits a keeper-signed
-  `rebalance` when it's above threshold. Shells out to the `stellar` CLI
-  (`crates/scheduler/src/chain.rs`) rather than a hand-rolled Soroban
-  RPC/XDR client, since there's no first-party Rust client for that and
-  the CLI is exactly what this project's testnet deploys and smoke tests
-  already use. Fixed-interval polling (`tokio::time::interval`), not the
-  `tokio-cron-scheduler` originally sketched below - simpler, and a fixed
-  interval is all Phase 1 actually needs; cron-style scheduling can come
-  back if a real need for it (e.g. per-strategy schedules) shows up.
+  `rebalance` when it's above threshold; also polls both `rebalancer-oracle`
+  sources for every configured asset each tick, records both into
+  `price_snapshots`, and logs a warning if they've diverged past a
+  configurable threshold (`PRICE_DIVERGENCE_WARN_BPS`). Shells out to the
+  `stellar` CLI (`crates/scheduler/src/chain.rs`) rather than a
+  hand-rolled Soroban RPC/XDR client, since there's no first-party Rust
+  client for that and the CLI is exactly what this project's testnet
+  deploys and smoke tests already use. Fixed-interval polling
+  (`tokio::time::interval`), not the `tokio-cron-scheduler` originally
+  sketched below - simpler, and a fixed interval is all Phase 1/2 actually
+  needs; cron-style scheduling can come back if a real need for it (e.g.
+  per-strategy schedules) shows up.
 
-More crates (`api`, `oracle`, `chain`, `notify`) land as later build
-phases reach them - see `../PROJECT.md` section 5.
+More crates (`api`, `chain`, `notify`) land as later build phases reach
+them - see `../PROJECT.md` section 5.
 
 ### Running the scheduler locally
 
@@ -58,6 +73,14 @@ on-chain quirk this surfaced: `needs_rebalance` currently reads an empty
 vault as needing a rebalance too, so an empty/unfunded vault will show up
 here as constantly "due" - harmless today, worth fixing in `contracts`
 before Phase 4.
+
+Each tick also polls Reflector (via `ORACLE_ADAPTER_CONTRACT_ID`) and
+CoinGecko for every asset in `crates/scheduler/src/pricing.rs`'s fixed
+asset list, logging `price cross-check ok`/`... have diverged` at
+`INFO`/`WARN`. CoinGecko's public API rejects requests without a
+descriptive User-Agent outright (not just harsher rate limiting) -
+`CoinGeckoClient::new` sets one; if you see every `coingecko price read
+failed` in a row, that's usually why.
 
 ## Build & test
 
@@ -86,7 +109,7 @@ default to the URL above if `DATABASE_URL` isn't set.
 ## Status
 
 Phase 0 (foundations) done: `rebalancer-core` (13 tests) and `rebalancer-db`
-(6 migrations + 8 integration tests, run against a real local Postgres).
+(6 migrations + 9 integration tests, run against a real local Postgres).
 
 Phase 1: `rebalancer-scheduler` done and verified live against the
 deployed testnet vault (keeper authorized via `set_keeper`, drift
@@ -94,3 +117,11 @@ detection and rebalance submission both confirmed working end-to-end;
 every submission currently fails closed with `RouterNotConfigured` since
 no router exists yet - see above). No API yet - the frontend still reads
 the contract directly.
+
+Phase 2 (pricing): `rebalancer-oracle` done (10 tests) and wired into the
+scheduler's tick, verified live - both sources agree closely for real
+(XLM 0 bps apart, USDC 3 bps apart, in one captured run). Circuit
+breaker + concentration limits (`risk_guard`) also done - see the
+`contracts` repo, this backend doesn't interact with `risk_guard`
+directly (the scheduler's `chain.rs` only ever calls `vault`, which
+calls `risk_guard` on its own). Notifications not yet built.

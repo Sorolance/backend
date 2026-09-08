@@ -34,6 +34,16 @@ pub struct Config {
     /// for it (it doesn't today).
     pub threshold_bps: i32,
     pub poll_interval_secs: u64,
+    /// The deployed `oracle_adapter` this vault reads from - needed here
+    /// (separately from `vault_contract_id`) because `observe_market_prices`
+    /// reads Reflector prices directly, for the CoinGecko cross-check.
+    pub oracle_adapter_contract_id: String,
+    /// How far apart the Reflector- and CoinGecko-derived prices for the
+    /// same asset can be, in bps of the CoinGecko price, before it's
+    /// logged as a warning. Purely observational today (see
+    /// `rebalancer_oracle`'s crate doc comment for why) - nothing acts on
+    /// this beyond a log line.
+    pub price_divergence_warn_bps: u32,
 }
 
 #[derive(Debug)]
@@ -72,6 +82,8 @@ impl Config {
             portfolio_name: optional("PORTFOLIO_NAME", "Demo Portfolio"),
             threshold_bps: parse_optional("THRESHOLD_BPS", 500)?,
             poll_interval_secs: parse_optional("POLL_INTERVAL_SECS", 300)?,
+            oracle_adapter_contract_id: require("ORACLE_ADAPTER_CONTRACT_ID")?,
+            price_divergence_warn_bps: parse_optional("PRICE_DIVERGENCE_WARN_BPS", 300)?,
         })
     }
 }

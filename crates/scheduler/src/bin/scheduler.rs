@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use rebalancer_db::{connect, upsert_portfolio, MIGRATOR};
+use rebalancer_oracle::coingecko::CoinGeckoClient;
+use rebalancer_oracle::on_chain::OnChainPriceReader;
 use rebalancer_scheduler::chain::ChainClient;
+use rebalancer_scheduler::pricing::observe_market_prices;
 use rebalancer_scheduler::{config::Config, run_once};
 use tracing::{error, info};
 
@@ -45,6 +48,16 @@ async fn main() {
         keeper_identity: config.keeper_identity.clone(),
         keeper_address: config.keeper_address.clone(),
     };
+    let on_chain_prices = OnChainPriceReader {
+        stellar_cli: config.stellar_cli.clone(),
+        rpc_url: config.rpc_url.clone(),
+        network_passphrase: config.network_passphrase.clone(),
+        oracle_adapter_id: config.oracle_adapter_contract_id.clone(),
+        // Read-only - reuses the keeper identity rather than requiring a
+        // separate one just to source a funded --source-account.
+        source_account: config.keeper_identity.clone(),
+    };
+    let coingecko = CoinGeckoClient::new();
 
     info!(
         portfolio_id = %portfolio.id,
@@ -56,6 +69,16 @@ async fn main() {
     let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval_secs));
     loop {
         interval.tick().await;
+        if let Err(e) = observe_market_prices(
+            &pool,
+            &on_chain_prices,
+            &coingecko,
+            config.price_divergence_warn_bps,
+        )
+        .await
+        {
+            error!(error = %e, "price observation tick failed");
+        }
         if let Err(e) = run_once(&pool, &chain, portfolio.id).await {
             error!(error = %e, "tick failed");
         }
