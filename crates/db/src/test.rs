@@ -162,3 +162,63 @@ async fn price_snapshot_numeric_round_trips_full_i128_range() {
 
     tx.rollback().await.unwrap();
 }
+
+#[tokio::test]
+async fn upsert_portfolio_inserts_then_updates_in_place() {
+    let pool = test_pool().await;
+    let vault_address = format!("CTEST{}", Uuid::new_v4().simple());
+
+    let first = upsert_portfolio(&pool, &vault_address, "GOWNER_OLD", "first name", 500)
+        .await
+        .expect("first upsert inserts");
+    assert_eq!(first.owner_address, "GOWNER_OLD");
+    assert_eq!(first.name, "first name");
+    assert_eq!(first.threshold_bps, 500);
+
+    let second = upsert_portfolio(&pool, &vault_address, "GOWNER_NEW", "second name", 800)
+        .await
+        .expect("second upsert updates the same row");
+    assert_eq!(second.id, first.id, "same vault_address must be the same row");
+    assert_eq!(second.owner_address, "GOWNER_NEW");
+    assert_eq!(second.name, "second name");
+    assert_eq!(second.threshold_bps, 800);
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(first.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn insert_rebalance_event_is_idempotent_on_tx_hash() {
+    let pool = test_pool().await;
+    let vault_address = format!("CTEST{}", Uuid::new_v4().simple());
+    let portfolio = upsert_portfolio(&pool, &vault_address, "GOWNER", "idempotency test", 500)
+        .await
+        .expect("upsert portfolio");
+
+    let tx_hash = format!("{}", Uuid::new_v4().simple());
+    let trades = serde_json::json!([]);
+
+    let first = insert_rebalance_event(&pool, portfolio.id, &tx_hash, Utc::now(), trades.clone())
+        .await
+        .expect("first insert succeeds")
+        .expect("first insert returns the new row");
+    assert_eq!(first.tx_hash, tx_hash);
+    assert_eq!(first.portfolio_id, portfolio.id);
+
+    let second = insert_rebalance_event(&pool, portfolio.id, &tx_hash, Utc::now(), trades)
+        .await
+        .expect("retry does not error");
+    assert!(
+        second.is_none(),
+        "duplicate tx_hash must be a no-op, not a second row"
+    );
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

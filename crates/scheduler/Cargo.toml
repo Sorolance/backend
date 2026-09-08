@@ -1,0 +1,17 @@
+[package]
+name = "rebalancer-scheduler"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+rebalancer-db = { path = "../db" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde_json = "1"
+
+[[bin]]
+name = "rebalancer-scheduler"
+path = "src/bin/scheduler.rs"

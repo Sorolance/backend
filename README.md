@@ -19,8 +19,45 @@ Rust/axum backend. See `../PROJECT.md` for the full project plan.
   `api`/`scheduler` exist in Phase 1, so there's no real interface to build
   against yet.
 
-More crates (`api`, `oracle`, `chain`, `scheduler`, `notify`) land as later
-build phases reach them - see `../PROJECT.md` section 5.
+- `crates/scheduler` (package `rebalancer-scheduler`) — polls the deployed
+  `vault` contract for drift on an interval and submits a keeper-signed
+  `rebalance` when it's above threshold. Shells out to the `stellar` CLI
+  (`crates/scheduler/src/chain.rs`) rather than a hand-rolled Soroban
+  RPC/XDR client, since there's no first-party Rust client for that and
+  the CLI is exactly what this project's testnet deploys and smoke tests
+  already use. Fixed-interval polling (`tokio::time::interval`), not the
+  `tokio-cron-scheduler` originally sketched below - simpler, and a fixed
+  interval is all Phase 1 actually needs; cron-style scheduling can come
+  back if a real need for it (e.g. per-strategy schedules) shows up.
+
+More crates (`api`, `oracle`, `chain`, `notify`) land as later build
+phases reach them - see `../PROJECT.md` section 5.
+
+### Running the scheduler locally
+
+```sh
+stellar keys generate rebalancer-keeper --network testnet --fund
+stellar keys address rebalancer-keeper   # -> KEEPER_ADDRESS
+
+# One-time: the vault owner must authorize the keeper before the
+# scheduler can call `rebalance`. rebalancer-owner is the deployer
+# identity from PROJECT.md's testnet deployment.
+stellar contract invoke --id <VAULT_CONTRACT_ID> --source-account rebalancer-owner \
+  --rpc-url https://soroban-testnet.stellar.org \
+  --network-passphrase "Test SDF Network ; September 2015" --send=yes \
+  -- set_keeper --keeper <KEEPER_ADDRESS>
+
+cp ../.env.example ../.env   # fill in KEEPER_IDENTITY/KEEPER_ADDRESS above
+cargo run -p rebalancer-scheduler --bin rebalancer-scheduler
+```
+
+Until Phase 4 wires a router, every attempted `rebalance` fails closed
+with `RouterNotConfigured` - that's expected, logged as a warning, and
+does not crash the loop. See `crates/scheduler/src/lib.rs` for a known
+on-chain quirk this surfaced: `needs_rebalance` currently reads an empty
+vault as needing a rebalance too, so an empty/unfunded vault will show up
+here as constantly "due" - harmless today, worth fixing in `contracts`
+before Phase 4.
 
 ## Build & test
 
@@ -49,5 +86,11 @@ default to the URL above if `DATABASE_URL` isn't set.
 ## Status
 
 Phase 0 (foundations) done: `rebalancer-core` (13 tests) and `rebalancer-db`
-(6 migrations + 4 integration tests, run against a real local Postgres).
-Nothing else yet - no API, no chain client, no scheduler.
+(6 migrations + 8 integration tests, run against a real local Postgres).
+
+Phase 1: `rebalancer-scheduler` done and verified live against the
+deployed testnet vault (keeper authorized via `set_keeper`, drift
+detection and rebalance submission both confirmed working end-to-end;
+every submission currently fails closed with `RouterNotConfigured` since
+no router exists yet - see above). No API yet - the frontend still reads
+the contract directly.
