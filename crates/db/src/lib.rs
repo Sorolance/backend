@@ -179,5 +179,28 @@ pub async fn insert_price_snapshot(
     .await
 }
 
+/// Active webhook subscribers for one portfolio and event type -
+/// `event_type` must be present in a row's `event_types` array (an
+/// unrestricted `TEXT[]`, so this list of valid values lives in
+/// `rebalancer-notify`/`rebalancer-scheduler`, not a DB constraint) and
+/// `is_active` must be true. Empty results are the common case (no
+/// onboarding API/UI exists yet to register a webhook at all - see
+/// PROJECT.md) and callers should treat that as "nothing to do", not an
+/// error.
+pub async fn list_active_webhooks(
+    pool: &PgPool,
+    portfolio_id: Uuid,
+    event_type: &str,
+) -> Result<Vec<Webhook>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT * FROM webhooks
+         WHERE portfolio_id = $1 AND is_active = true AND $2 = ANY(event_types)",
+    )
+    .bind(portfolio_id)
+    .bind(event_type)
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod test;

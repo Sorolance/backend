@@ -1,11 +1,12 @@
 use std::time::Duration;
 
 use rebalancer_db::{connect, upsert_portfolio, MIGRATOR};
+use rebalancer_notify::WebhookClient;
 use rebalancer_oracle::coingecko::CoinGeckoClient;
 use rebalancer_oracle::on_chain::OnChainPriceReader;
 use rebalancer_scheduler::chain::ChainClient;
 use rebalancer_scheduler::pricing::observe_market_prices;
-use rebalancer_scheduler::{config::Config, run_once};
+use rebalancer_scheduler::{config::Config, observe_risk_once, run_once};
 use tracing::{error, info};
 
 #[tokio::main]
@@ -58,6 +59,7 @@ async fn main() {
         source_account: config.keeper_identity.clone(),
     };
     let coingecko = CoinGeckoClient::new();
+    let webhook_client = WebhookClient::new();
 
     info!(
         portfolio_id = %portfolio.id,
@@ -79,7 +81,18 @@ async fn main() {
         {
             error!(error = %e, "price observation tick failed");
         }
-        if let Err(e) = run_once(&pool, &chain, portfolio.id).await {
+        if let Err(e) = observe_risk_once(
+            &pool,
+            &chain,
+            &webhook_client,
+            portfolio.id,
+            &config.vault_contract_id,
+        )
+        .await
+        {
+            error!(error = %e, "risk observation tick failed");
+        }
+        if let Err(e) = run_once(&pool, &chain, &webhook_client, portfolio.id).await {
             error!(error = %e, "tick failed");
         }
     }

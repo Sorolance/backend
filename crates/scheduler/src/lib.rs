@@ -19,11 +19,13 @@
 
 pub mod chain;
 pub mod config;
+pub mod notifications;
 pub mod pricing;
 
 use chain::{ChainClient, ChainError};
 use chrono::Utc;
 use rebalancer_db::{PgPool, Uuid};
+use rebalancer_notify::WebhookClient;
 use tracing::{error, info, warn};
 
 /// One poll-and-maybe-rebalance cycle for a single portfolio. Blocking
@@ -34,6 +36,7 @@ use tracing::{error, info, warn};
 pub async fn run_once(
     pool: &PgPool,
     chain: &ChainClient,
+    webhook_client: &WebhookClient,
     portfolio_id: Uuid,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let c = chain.clone();
@@ -56,7 +59,17 @@ pub async fn run_once(
             )
             .await?;
             match inserted {
-                Some(event) => info!(tx_hash = %event.tx_hash, "rebalance submitted and recorded"),
+                Some(event) => {
+                    info!(tx_hash = %event.tx_hash, "rebalance submitted and recorded");
+                    notifications::notify_rebalance_completed(
+                        pool,
+                        webhook_client,
+                        portfolio_id,
+                        &event.tx_hash,
+                        event.executed_at,
+                    )
+                    .await;
+                }
                 None => warn!(
                     tx_hash = %outcome.tx_hash,
                     "rebalance tx already recorded, skipping duplicate insert"
@@ -71,6 +84,42 @@ pub async fn run_once(
         }
         Err(e) => {
             error!(error = %e, "rebalance submission failed unexpectedly");
+        }
+    }
+    Ok(())
+}
+
+/// Feeds current oracle prices into the configured `risk_guard` (via
+/// `vault::observe_risk`) and dispatches a webhook if this call just
+/// tripped the breaker. Independent of `run_once` - called every tick
+/// regardless of whether a rebalance is imminent, matching `risk_guard`'s
+/// own design intent (see the `contracts` repo: "called on the same
+/// interval a keeper polls drift").
+pub async fn observe_risk_once(
+    pool: &PgPool,
+    chain: &ChainClient,
+    webhook_client: &WebhookClient,
+    portfolio_id: Uuid,
+    vault_contract_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let c = chain.clone();
+    match tokio::task::spawn_blocking(move || c.observe_risk()).await? {
+        Ok(true) => {
+            warn!("circuit breaker just tripped");
+            notifications::notify_circuit_breaker_tripped(
+                pool,
+                webhook_client,
+                portfolio_id,
+                vault_contract_id,
+            )
+            .await;
+        }
+        Ok(false) => {}
+        Err(ChainError::Contract(vault_err)) => {
+            warn!(?vault_err, "observe_risk rejected by vault");
+        }
+        Err(e) => {
+            error!(error = %e, "observe_risk failed unexpectedly");
         }
     }
     Ok(())

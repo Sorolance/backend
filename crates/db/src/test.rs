@@ -267,3 +267,54 @@ async fn insert_price_snapshot_allows_multiple_rows_per_asset() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn list_active_webhooks_filters_by_event_type_and_active_flag() {
+    let pool = test_pool().await;
+    let vault_address = format!("CTEST{}", Uuid::new_v4().simple());
+    let portfolio = upsert_portfolio(&pool, &vault_address, "GOWNER", "webhook test", 500)
+        .await
+        .expect("upsert portfolio");
+
+    let matching: Uuid = sqlx::query_scalar(
+        "INSERT INTO webhooks (portfolio_id, url, secret, event_types, is_active)
+         VALUES ($1, 'https://example.com/a', 'secret-a', ARRAY['rebalance.completed'], true)
+         RETURNING id",
+    )
+    .bind(portfolio.id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert matching webhook");
+
+    // Wrong event type - must not match.
+    sqlx::query(
+        "INSERT INTO webhooks (portfolio_id, url, secret, event_types, is_active)
+         VALUES ($1, 'https://example.com/b', 'secret-b', ARRAY['risk.circuit_breaker_tripped'], true)",
+    )
+    .bind(portfolio.id)
+    .execute(&pool)
+    .await
+    .expect("insert non-matching event type webhook");
+
+    // Right event type, but inactive - must not match.
+    sqlx::query(
+        "INSERT INTO webhooks (portfolio_id, url, secret, event_types, is_active)
+         VALUES ($1, 'https://example.com/c', 'secret-c', ARRAY['rebalance.completed'], false)",
+    )
+    .bind(portfolio.id)
+    .execute(&pool)
+    .await
+    .expect("insert inactive webhook");
+
+    let results = list_active_webhooks(&pool, portfolio.id, "rebalance.completed")
+        .await
+        .expect("list webhooks");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, matching);
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

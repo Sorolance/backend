@@ -128,6 +128,31 @@ impl ChainClient {
         }
     }
 
+    /// Submits `vault::observe_risk(caller = keeper)`, signed by the
+    /// keeper identity - feeds current oracle prices into the configured
+    /// `risk_guard` so its circuit breaker stays current independent of
+    /// whether a rebalance is imminent (see the `contracts` repo).
+    /// Returns `true` if this call just tripped the breaker (it wasn't
+    /// already tripped); `false` covers "no risk_guard configured", "no
+    /// trip", and "was already tripped" alike - callers that need to
+    /// distinguish those should call `vault::is_tripped` via
+    /// `risk_guard` directly, which this client doesn't wrap since
+    /// nothing here needs to yet.
+    pub fn observe_risk(&self) -> Result<bool, ChainError> {
+        let mut args = self.common_args();
+        args.push("--send=yes".into());
+        args.push("--".into());
+        args.push("observe_risk".into());
+        args.push("--caller".into());
+        args.push(self.keeper_address.clone());
+        let out = self.run(&args)?;
+        match out.stdout.trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(ChainError::UnexpectedOutput(other.to_string())),
+        }
+    }
+
     /// Submits `vault::rebalance(caller = keeper, trades = [])`, signed by
     /// the keeper identity. No router is wired in as of Phase 1, so this
     /// is *expected* to fail closed with `RouterNotConfigured` until
