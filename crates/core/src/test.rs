@@ -198,3 +198,84 @@ fn needs_rebalance_boundary_is_inclusive() {
     assert_eq!(allocation[0].drift_bps, 500);
     assert!(needs_rebalance(&allocation, 500));
 }
+
+#[test]
+fn needs_rebalance_per_asset_uses_each_assets_own_threshold() {
+    let states = vec![
+        AssetState {
+            asset: "XLM",
+            balance: 6_500,
+            price: 1,
+        },
+        AssetState {
+            asset: "USDC",
+            balance: 3_500,
+            price: 1,
+        },
+    ];
+    let allocation = compute_allocation(&targets(), &states);
+    // Both legs drift +/-500bps. A threshold fn that only lets USDC
+    // through (XLM's own threshold set higher than its drift) must still
+    // report true, since `.any()` checks every entry against its own
+    // threshold independently.
+    assert!(needs_rebalance_per_asset(&allocation, |asset| match *asset {
+        "XLM" => 1_000,
+        _ => 100,
+    }));
+    // Raise both above their drift - now neither leg qualifies.
+    assert!(!needs_rebalance_per_asset(&allocation, |_| 1_000));
+}
+
+#[test]
+fn calendar_due_is_false_before_interval_and_true_at_or_past_it() {
+    assert!(!calendar_due(29, 30));
+    assert!(calendar_due(30, 30));
+    assert!(calendar_due(31, 30));
+}
+
+#[test]
+fn calendar_due_treats_zero_interval_as_never_due() {
+    assert!(!calendar_due(0, 0));
+    assert!(!calendar_due(100, 0));
+}
+
+#[test]
+fn realized_volatility_is_zero_for_flat_prices() {
+    assert_eq!(realized_volatility_bps(&[100, 100, 100, 100]), 0);
+}
+
+#[test]
+fn realized_volatility_is_zero_with_fewer_than_two_returns() {
+    assert_eq!(realized_volatility_bps(&[]), 0);
+    assert_eq!(realized_volatility_bps(&[100]), 0);
+    // A single return has zero deviation from its own mean by
+    // definition - not enough data to call it "volatile".
+    assert_eq!(realized_volatility_bps(&[100, 110]), 0);
+}
+
+#[test]
+fn realized_volatility_is_nonzero_and_scales_with_swing_size() {
+    let mild = realized_volatility_bps(&[100, 105, 100, 105, 100]);
+    let wild = realized_volatility_bps(&[100, 150, 100, 150, 100]);
+    assert!(mild > 0);
+    assert!(wild > mild, "bigger swings must produce higher realized volatility");
+}
+
+#[test]
+fn realized_volatility_skips_non_positive_prices_instead_of_dividing_by_zero() {
+    // A non-positive price can't happen from a real oracle, but must not
+    // panic if it ever shows up in a data feed.
+    let vol = realized_volatility_bps(&[100, 0, 100, 105, 100]);
+    assert!(vol < u32::MAX);
+}
+
+#[test]
+fn volatility_adjusted_threshold_scales_with_volatility_and_clamps() {
+    // 1:1 multiplier, mid-range volatility stays within the band.
+    assert_eq!(volatility_adjusted_threshold_bps(300, BPS_DENOM as u32, 100, 2_000), 300);
+    // A perfectly calm asset (0 realized volatility) is floored at the
+    // minimum, never at an unusable 0.
+    assert_eq!(volatility_adjusted_threshold_bps(0, BPS_DENOM as u32, 100, 2_000), 100);
+    // A wildly volatile asset is capped at the maximum.
+    assert_eq!(volatility_adjusted_threshold_bps(50_000, BPS_DENOM as u32, 100, 2_000), 2_000);
+}

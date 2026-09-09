@@ -127,5 +127,102 @@ pub fn needs_rebalance<Asset>(allocation: &[AllocationEntry<Asset>], threshold_b
         .any(|e| e.drift_bps.unsigned_abs() >= threshold_bps)
 }
 
+/// Same decision as `needs_rebalance`, but with a per-asset threshold
+/// instead of one global value - what `Strategy::VolatilityBand` needs,
+/// since each asset's effective threshold depends on its own realized
+/// volatility (see `volatility_adjusted_threshold_bps`).
+pub fn needs_rebalance_per_asset<Asset>(
+    allocation: &[AllocationEntry<Asset>],
+    threshold_bps: impl Fn(&Asset) -> u32,
+) -> bool {
+    allocation
+        .iter()
+        .any(|e| e.drift_bps.unsigned_abs() >= threshold_bps(&e.asset))
+}
+
+/// Which rule decides *when* a rebalance fires - the three templates from
+/// PROJECT.md section 3. `Threshold` is what `vault::needs_rebalance`
+/// already enforces on-chain today; `Calendar` and `VolatilityBand` exist
+/// here (and in `rebalancer-backtest`) before anything on-chain
+/// represents them - see `contracts/contracts/strategy_registry`'s
+/// "not yet built" status in PROJECT.md.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Strategy {
+    /// Rebalance whenever any asset's drift meets or exceeds
+    /// `threshold_bps`.
+    Threshold { threshold_bps: u32 },
+    /// Rebalance every `interval_days`, regardless of drift.
+    Calendar { interval_days: u32 },
+    /// Threshold-based, but each asset's effective threshold is derived
+    /// from that asset's own realized volatility instead of staying
+    /// fixed - see `volatility_adjusted_threshold_bps`.
+    VolatilityBand {
+        /// Effective threshold = realized volatility (bps) * this,
+        /// scaled by `BPS_DENOM` (so `BPS_DENOM` itself means "threshold
+        /// tracks volatility 1:1").
+        vol_multiplier_bps: u32,
+        min_threshold_bps: u32,
+        max_threshold_bps: u32,
+    },
+}
+
+/// True once at least `interval_days` have elapsed since the last
+/// rebalance - the calendar strategy's whole decision rule. Takes a
+/// plain day count rather than a specific date type so callers (chrono's
+/// `NaiveDate` in the backtester, a Soroban ledger timestamp on-chain)
+/// don't need to share a date library.
+pub fn calendar_due(days_since_last_rebalance: u32, interval_days: u32) -> bool {
+    interval_days > 0 && days_since_last_rebalance >= interval_days
+}
+
+/// Realized volatility of a price series, as the standard deviation of
+/// simple period-over-period returns, expressed in bps (so directly
+/// comparable to a drift value). Needs at least 2 prices to produce a
+/// single return, and at least 2 *returns* (3 prices) to produce a
+/// non-zero standard deviation - fewer than that returns 0, treating
+/// "not enough history yet" the same as "observed to be perfectly calm"
+/// rather than as an error, since a strategy built on this should keep
+/// running through a short history, not fail closed on day one.
+/// Zero-or-negative prices in the series are skipped (division by zero,
+/// and a real oracle price is never non-positive) rather than treated as
+/// a hard error, consistent with `compute_allocation`'s own leniency.
+pub fn realized_volatility_bps(prices: &[i128]) -> u32 {
+    let returns: Vec<f64> = prices
+        .windows(2)
+        .filter(|w| w[0] > 0)
+        .map(|w| (w[1] - w[0]) as f64 / w[0] as f64)
+        .collect();
+    if returns.len() < 2 {
+        return 0;
+    }
+    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+    let variance =
+        returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+    let bps = (variance.sqrt() * BPS_DENOM as f64).round();
+    if bps <= 0.0 {
+        0
+    } else if bps >= u32::MAX as f64 {
+        u32::MAX
+    } else {
+        bps as u32
+    }
+}
+
+/// Scales `realized_volatility_bps` by `vol_multiplier_bps` to get an
+/// effective drift threshold, clamped to `[min_threshold_bps,
+/// max_threshold_bps]` so a perfectly calm asset can't collapse to a
+/// threshold of 0 (any nonzero drift would perpetually "trigger") and a
+/// wildly volatile one can't push the threshold to an unusable extreme.
+pub fn volatility_adjusted_threshold_bps(
+    realized_volatility_bps: u32,
+    vol_multiplier_bps: u32,
+    min_threshold_bps: u32,
+    max_threshold_bps: u32,
+) -> u32 {
+    let scaled = (realized_volatility_bps as u64).saturating_mul(vol_multiplier_bps as u64)
+        / BPS_DENOM as u64;
+    (scaled as u32).clamp(min_threshold_bps, max_threshold_bps)
+}
+
 #[cfg(test)]
 mod test;
