@@ -114,6 +114,59 @@ fn a_rebalanced_portfolio_does_not_immediately_re_trigger_on_a_quiet_day() {
 }
 
 #[test]
+fn a_rebalance_records_realized_gain_loss_on_the_asset_sold() {
+    // XLM starts at 100 (60 units bought), then 10x's to 1000 - selling
+    // 22 units at 1000 against a 100 cost basis realizes (1000-100)*22
+    // = 19,800. USDC is only ever bought here, so it contributes 0.
+    let daily_prices = vec![
+        (date(1), vec![("XLM".to_string(), 100), ("USDC".to_string(), 100)]),
+        (date(2), vec![("XLM".to_string(), 1_000), ("USDC".to_string(), 100)]),
+    ];
+
+    let report = run_backtest(
+        &Strategy::Threshold { threshold_bps: 500 },
+        &targets(),
+        10_000,
+        &daily_prices,
+    )
+    .unwrap();
+
+    assert_eq!(report.rebalances.len(), 1);
+    assert_eq!(report.rebalances[0].realized_gain_loss, 19_800);
+    assert_eq!(report.total_realized_gain_loss, 19_800);
+}
+
+#[test]
+fn realized_gain_loss_accumulates_correctly_across_sequential_rebalances_with_fifo_lots() {
+    // Three days, two rebalances, each disposing against lots opened on
+    // a prior day at a different price - a regression test that FIFO
+    // matching (and its cost basis) carries correctly from one
+    // rebalance into the next, not just within a single one.
+    let daily_prices = vec![
+        (date(1), vec![("XLM".to_string(), 100), ("USDC".to_string(), 100)]),
+        (date(2), vec![("XLM".to_string(), 200), ("USDC".to_string(), 100)]),
+        (date(3), vec![("XLM".to_string(), 50), ("USDC".to_string(), 150)]),
+    ];
+
+    let report = run_backtest(
+        &Strategy::Threshold { threshold_bps: 500 },
+        &targets(),
+        10_000,
+        &daily_prices,
+    )
+    .unwrap();
+
+    assert_eq!(report.rebalances.len(), 2);
+    // Day 2: sells 12 XLM (cost basis 100) at 200 -> gain 1,200.
+    assert_eq!(report.rebalances[0].realized_gain_loss, 1_200);
+    // Day 3: sells 32 USDC, all still at its original 100 cost basis
+    // (that lot was only ever partially disposed on day 2), at 150 ->
+    // gain 1,600.
+    assert_eq!(report.rebalances[1].realized_gain_loss, 1_600);
+    assert_eq!(report.total_realized_gain_loss, 2_800);
+}
+
+#[test]
 fn unknown_target_asset_is_a_typed_error_not_a_panic() {
     let daily_prices = vec![(date(1), vec![("XLM".to_string(), 100)])]; // no USDC price at all
 

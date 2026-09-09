@@ -134,13 +134,22 @@ async fn main() {
         report.final_value as f64 / scale,
         report.total_return_bps as f64 / 100.0
     );
-    println!("Rebalances: {}", report.rebalances.len());
+    println!(
+        "Rebalances: {} (total realized gain/loss: ${:+.2})",
+        report.rebalances.len(),
+        report.total_realized_gain_loss as f64 / scale
+    );
     for rebalance in &report.rebalances {
         let drift: Vec<String> = rebalance
             .allocation_before
             .iter()
             .map(|e| format!("{}: {:+.2}%", e.asset, e.drift_bps as f64 / 100.0))
             .collect();
-        println!("  {} - drift at trigger: {}", rebalance.date, drift.join(", "));
+        println!(
+            "  {} - drift at trigger: {} - realized gain/loss: ${:+.2}",
+            rebalance.date,
+            drift.join(", "),
+            rebalance.realized_gain_loss as f64 / scale
+        );
     }
 }

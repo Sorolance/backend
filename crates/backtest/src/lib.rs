@@ -11,9 +11,13 @@
 //! "not yet built" status in PROJECT.md), so for those two this crate is
 //! currently the only place the decision logic runs at all.
 //!
+//! Every rebalance's realized gain/loss is tracked too, via
+//! `rebalancer_core::dispose_fifo` (PROJECT.md differentiator #3) -
+//! every net-bought asset opens a new lot at that day's price, every
+//! net-sold asset disposes FIFO against its existing lots.
+//!
 //! What this *doesn't* model: trade fees, slippage, or execution price
-//! impact (that's Phase 4's "fee-aware execution" differentiator) and
-//! cost-basis/tax-lot tracking (a separate Phase 3 item, not built yet).
+//! impact - that's Phase 4's "fee-aware execution" differentiator.
 //! Every simulated rebalance here is frictionless - it moves the
 //! portfolio to land exactly on target, the same simplification
 //! `frontend`'s demo mode uses for the same reason: there's no router
@@ -23,8 +27,8 @@
 
 use chrono::NaiveDate;
 use rebalancer_core::{
-    calendar_due, compute_allocation, needs_rebalance, needs_rebalance_per_asset,
-    realized_volatility_bps, volatility_adjusted_threshold_bps, AllocationEntry, AssetState,
+    calendar_due, compute_allocation, dispose_fifo, needs_rebalance, needs_rebalance_per_asset,
+    realized_volatility_bps, volatility_adjusted_threshold_bps, AllocationEntry, AssetState, Lot,
     Strategy, TargetWeight,
 };
 use std::collections::BTreeMap;
@@ -55,6 +59,12 @@ pub enum BacktestError {
     /// all - almost certainly a config mistake (wrong symbol string),
     /// not a data gap.
     UnknownAsset(String),
+    /// A rebalance tried to dispose more of an asset than its tracked
+    /// lots cover. Should never actually happen - every disposal here is
+    /// bounded by the balance this same code just tracked buying - so
+    /// this indicates an internal bookkeeping bug in this crate, not a
+    /// bad input; surfaced as a typed error rather than a panic anyway.
+    LotAccountingInconsistency(String),
 }
 
 impl std::fmt::Display for BacktestError {
@@ -64,6 +74,10 @@ impl std::fmt::Display for BacktestError {
                 write!(f, "no date has price data for every target asset")
             }
             Self::UnknownAsset(symbol) => write!(f, "no price series at all for asset {symbol}"),
+            Self::LotAccountingInconsistency(asset) => write!(
+                f,
+                "tried to dispose more {asset} than its tracked lots cover - internal bug"
+            ),
         }
     }
 }
@@ -76,6 +90,12 @@ pub struct RebalanceRecord {
     /// Allocation as it stood immediately before this rebalance -
     /// what actually triggered it.
     pub allocation_before: Vec<AllocationEntry<String>>,
+    /// Sum of realized gain/loss (see `rebalancer_core::dispose_fifo`)
+    /// across every asset net-sold in this rebalance, in the same scaled
+    /// units as the input prices. 0 is a real possible value (a disposal
+    /// at exactly its cost basis), not "nothing happened" - see
+    /// `rebalances` for whether this record exists at all.
+    pub realized_gain_loss: i128,
 }
 
 #[derive(Debug)]
@@ -88,6 +108,11 @@ pub struct BacktestReport {
     pub rebalances: Vec<RebalanceRecord>,
     pub final_value: i128,
     pub total_return_bps: i32,
+    /// Sum of every rebalance's `realized_gain_loss` - unrealized
+    /// gain/loss on whatever's still held at `final_value` is not
+    /// included, since PROJECT.md's differentiator scopes this to
+    /// gain/loss "computed per rebalance event".
+    pub total_realized_gain_loss: i128,
 }
 
 /// Intersects every series down to only the dates present in *all* of
@@ -137,9 +162,19 @@ pub fn run_backtest(
     let first_date = *first_date;
 
     let mut balances = balances_at_target(targets, first_prices, initial_value)?;
+    let mut lots: BTreeMap<String, Vec<Lot>> = targets
+        .iter()
+        .map(|t| {
+            let qty = *balances.get(&t.asset).unwrap_or(&0);
+            let price = price_for(first_prices, &t.asset).unwrap_or(0);
+            let opening_lots = if qty > 0 { vec![Lot { qty, price }] } else { Vec::new() };
+            (t.asset.clone(), opening_lots)
+        })
+        .collect();
 
     let mut equity_curve = Vec::with_capacity(daily_prices.len());
     let mut rebalances = Vec::new();
+    let mut total_realized_gain_loss: i128 = 0;
     let mut last_rebalance_date = first_date;
 
     for (index, (date, prices)) in daily_prices.iter().enumerate() {
@@ -182,11 +217,37 @@ pub fn run_backtest(
         };
 
         if due {
+            let new_balances = balances_at_target(targets, prices, total_value)?;
+            let mut rebalance_gain_loss: i128 = 0;
+            for target in targets {
+                let asset = &target.asset;
+                let price = price_for(prices, asset)?;
+                let old_qty = *balances.get(asset).unwrap_or(&0);
+                let new_qty = *new_balances.get(asset).unwrap_or(&0);
+                let asset_lots = lots.entry(asset.clone()).or_default();
+                match new_qty.cmp(&old_qty) {
+                    std::cmp::Ordering::Greater => {
+                        asset_lots.push(Lot {
+                            qty: new_qty - old_qty,
+                            price,
+                        });
+                    }
+                    std::cmp::Ordering::Less => {
+                        let (realized, remaining) = dispose_fifo(asset_lots, old_qty - new_qty, price)
+                            .map_err(|_| BacktestError::LotAccountingInconsistency(asset.clone()))?;
+                        *asset_lots = remaining;
+                        rebalance_gain_loss = rebalance_gain_loss.saturating_add(realized.gain_loss);
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+            total_realized_gain_loss = total_realized_gain_loss.saturating_add(rebalance_gain_loss);
             rebalances.push(RebalanceRecord {
                 date: *date,
                 allocation_before: allocation,
+                realized_gain_loss: rebalance_gain_loss,
             });
-            balances = balances_at_target(targets, prices, total_value)?;
+            balances = new_balances;
             last_rebalance_date = *date;
         }
     }
@@ -206,6 +267,7 @@ pub fn run_backtest(
         rebalances,
         final_value,
         total_return_bps,
+        total_realized_gain_loss,
     })
 }
 
