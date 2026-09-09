@@ -57,6 +57,17 @@ Rust/axum backend. See `../PROJECT.md` for the full project plan.
   interval is all Phase 1/2 actually needs; cron-style scheduling can come
   back if a real need for it (e.g. per-strategy schedules) shows up.
 
+- `crates/backtest` (package `rebalancer-backtest`) — replays the
+  threshold strategy against historical daily prices, reusing
+  `rebalancer_core::{compute_allocation, needs_rebalance}` unchanged so a
+  backtest reflects the same decision logic the live scheduler and
+  on-chain `vault` use, not a parallel reimplementation. Sources history
+  from `rebalancer_oracle::coingecko::CoinGeckoClient::market_chart`
+  (added alongside this crate). Frictionless - no fees/slippage (Phase
+  4) or cost-basis tracking (a separate Phase 3 item) modeled yet. Ships
+  a `backtest` CLI bin since there's no `api` crate yet to expose
+  `POST /portfolios/:id/backtest` for real.
+
 More crates (`api`, `chain`) land as later build phases reach them - see
 `../PROJECT.md` section 5.
 
@@ -157,3 +168,13 @@ Phase 2, all three items done:
   (Python's own `hmac` module, not this crate's code) confirmed valid.
   Email not built - needs a real provider/API key, a decision only the
   project owner can make.
+
+Phase 3, backtesting engine done: `rebalancer-backtest` (6 tests) +
+`rebalancer-oracle`'s new `market_chart` (2 tests). Verified live - `cargo
+run -p rebalancer-backtest --bin backtest -- 90` against real CoinGecko
+history for this project's 60/40 XLM/USDC, 500bps config produced 2
+rebalances, both triggered right at the threshold (e.g. XLM -5.22% /
+USDC +5.21%), confirming the replay matches `rebalancer-core`'s actual
+gate rather than drifting from it. Calendar/volatility-band strategy
+templates and cost-basis/lot tracking (Phase 3's other two items) not
+started yet.
