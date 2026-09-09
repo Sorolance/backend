@@ -1,10 +1,15 @@
-//! Replays the threshold strategy against historical daily prices,
-//! reusing `rebalancer_core::{compute_allocation, needs_rebalance}`
-//! unchanged - the exact same pure functions the live scheduler and the
-//! on-chain `vault` contract's own math mirror (see `rebalancer-core`'s
-//! crate doc comment) - so a backtest result reflects what the real
-//! decision logic would actually have done, not a separate
-//! reimplementation that could quietly drift out of sync with it.
+//! Replays any of `rebalancer_core::Strategy`'s templates against
+//! historical daily prices, reusing `rebalancer_core::compute_allocation`
+//! and each strategy's own decision primitives unchanged - the exact
+//! same pure functions the live scheduler and the on-chain `vault`
+//! contract's own math mirror for the threshold case (see
+//! `rebalancer-core`'s crate doc comment) - so a backtest result
+//! reflects what the real decision logic would actually have done, not a
+//! separate reimplementation that could quietly drift out of sync with
+//! it. Calendar and volatility-band strategies have no on-chain
+//! counterpart yet (see `contracts/contracts/strategy_registry`'s
+//! "not yet built" status in PROJECT.md), so for those two this crate is
+//! currently the only place the decision logic runs at all.
 //!
 //! What this *doesn't* model: trade fees, slippage, or execution price
 //! impact (that's Phase 4's "fee-aware execution" differentiator) and
@@ -17,8 +22,19 @@
 //! actually do today.
 
 use chrono::NaiveDate;
-use rebalancer_core::{compute_allocation, needs_rebalance, AllocationEntry, AssetState, TargetWeight};
+use rebalancer_core::{
+    calendar_due, compute_allocation, needs_rebalance, needs_rebalance_per_asset,
+    realized_volatility_bps, volatility_adjusted_threshold_bps, AllocationEntry, AssetState,
+    Strategy, TargetWeight,
+};
 use std::collections::BTreeMap;
+
+/// Trailing window (in aligned trading days) used to estimate an asset's
+/// realized volatility for `Strategy::VolatilityBand`. 14 days balances
+/// reacting to a real regime change against not just chasing single-day
+/// noise; not something this project has tuned against real performance
+/// data yet.
+const VOLATILITY_LOOKBACK_DAYS: usize = 14;
 
 /// One asset's daily USD-scaled price history, sorted ascending by date.
 /// "Scaled" mirrors `rebalancer_oracle::divergence_bps`'s convention:
@@ -103,36 +119,30 @@ pub fn align_daily(series: &[AssetPriceSeries]) -> Vec<(NaiveDate, Vec<(String, 
         .collect()
 }
 
-/// Replays the threshold strategy day by day: seeds initial balances
-/// from `initial_value` split across `targets` at the first aligned
-/// day's prices, then for each subsequent day recomputes drift and, if
-/// `needs_rebalance` says so, resets balances to land exactly on target
-/// at that day's prices (see the crate doc comment on why this is
-/// frictionless).
+/// Replays `strategy` day by day: seeds initial balances from
+/// `initial_value` split across `targets` at the first aligned day's
+/// prices, then for each subsequent day recomputes drift and, if the
+/// strategy's own rule says a rebalance is due, resets balances to land
+/// exactly on target at that day's prices (see the crate doc comment on
+/// why this is frictionless).
 pub fn run_backtest(
+    strategy: &Strategy,
     targets: &[TargetWeight<String>],
-    threshold_bps: u32,
     initial_value: i128,
     daily_prices: &[(NaiveDate, Vec<(String, i128)>)],
 ) -> Result<BacktestReport, BacktestError> {
-    let Some((_, first_prices)) = daily_prices.first() else {
+    let Some((first_date, first_prices)) = daily_prices.first() else {
         return Err(BacktestError::NoAlignedPriceData);
     };
+    let first_date = *first_date;
 
-    let mut balances: BTreeMap<String, i128> = BTreeMap::new();
-    for target in targets {
-        let price = price_for(first_prices, &target.asset)?;
-        let target_value = initial_value.saturating_mul(target.weight_bps as i128) / rebalancer_core::BPS_DENOM;
-        balances.insert(
-            target.asset.clone(),
-            if price > 0 { target_value / price } else { 0 },
-        );
-    }
+    let mut balances = balances_at_target(targets, first_prices, initial_value)?;
 
     let mut equity_curve = Vec::with_capacity(daily_prices.len());
     let mut rebalances = Vec::new();
+    let mut last_rebalance_date = first_date;
 
-    for (date, prices) in daily_prices {
+    for (index, (date, prices)) in daily_prices.iter().enumerate() {
         let mut states = Vec::with_capacity(targets.len());
         for target in targets {
             let price = price_for(prices, &target.asset)?;
@@ -150,20 +160,34 @@ pub fn run_backtest(
             .fold(0i128, |acc, v| acc.saturating_add(v));
         equity_curve.push((*date, total_value));
 
-        if needs_rebalance(&allocation, threshold_bps) {
+        let due = match strategy {
+            Strategy::Threshold { threshold_bps } => needs_rebalance(&allocation, *threshold_bps),
+            Strategy::Calendar { interval_days } => {
+                let days_elapsed = (*date - last_rebalance_date).num_days().max(0) as u32;
+                calendar_due(days_elapsed, *interval_days)
+            }
+            Strategy::VolatilityBand {
+                vol_multiplier_bps,
+                min_threshold_bps,
+                max_threshold_bps,
+            } => needs_rebalance_per_asset(&allocation, |asset| {
+                let vol = realized_volatility_for_asset(daily_prices, index, asset);
+                volatility_adjusted_threshold_bps(
+                    vol,
+                    *vol_multiplier_bps,
+                    *min_threshold_bps,
+                    *max_threshold_bps,
+                )
+            }),
+        };
+
+        if due {
             rebalances.push(RebalanceRecord {
                 date: *date,
                 allocation_before: allocation,
             });
-            for target in targets {
-                let price = price_for(prices, &target.asset)?;
-                let target_value =
-                    total_value.saturating_mul(target.weight_bps as i128) / rebalancer_core::BPS_DENOM;
-                balances.insert(
-                    target.asset.clone(),
-                    if price > 0 { target_value / price } else { 0 },
-                );
-            }
+            balances = balances_at_target(targets, prices, total_value)?;
+            last_rebalance_date = *date;
         }
     }
 
@@ -185,12 +209,56 @@ pub fn run_backtest(
     })
 }
 
+/// Splits `total_value` across `targets` at `prices`, in whole asset
+/// units - used both to seed the initial portfolio and to reset balances
+/// on every rebalance, so the two can never drift apart in behavior.
+fn balances_at_target(
+    targets: &[TargetWeight<String>],
+    prices: &[(String, i128)],
+    total_value: i128,
+) -> Result<BTreeMap<String, i128>, BacktestError> {
+    let mut balances = BTreeMap::new();
+    for target in targets {
+        let price = price_for(prices, &target.asset)?;
+        let target_value =
+            total_value.saturating_mul(target.weight_bps as i128) / rebalancer_core::BPS_DENOM;
+        balances.insert(
+            target.asset.clone(),
+            if price > 0 { target_value / price } else { 0 },
+        );
+    }
+    Ok(balances)
+}
+
 fn price_for(prices: &[(String, i128)], asset: &str) -> Result<i128, BacktestError> {
     prices
         .iter()
         .find(|(symbol, _)| symbol == asset)
         .map(|(_, price)| *price)
         .ok_or_else(|| BacktestError::UnknownAsset(asset.to_string()))
+}
+
+/// Realized volatility of `asset` over the trailing `VOLATILITY_LOOKBACK_DAYS`
+/// aligned trading days up to and including `daily_prices[up_to_index]` -
+/// deliberately inclusive of "today" (not just prior days) since the
+/// strategy is deciding using today's own close, the same price it just
+/// computed drift from.
+fn realized_volatility_for_asset(
+    daily_prices: &[(NaiveDate, Vec<(String, i128)>)],
+    up_to_index: usize,
+    asset: &str,
+) -> u32 {
+    let start = up_to_index.saturating_sub(VOLATILITY_LOOKBACK_DAYS.saturating_sub(1));
+    let prices: Vec<i128> = daily_prices[start..=up_to_index]
+        .iter()
+        .filter_map(|(_, prices)| {
+            prices
+                .iter()
+                .find(|(symbol, _)| symbol == asset)
+                .map(|(_, price)| *price)
+        })
+        .collect();
+    realized_volatility_bps(&prices)
 }
 
 #[cfg(test)]
