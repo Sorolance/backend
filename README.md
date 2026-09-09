@@ -169,12 +169,37 @@ Phase 2, all three items done:
   Email not built - needs a real provider/API key, a decision only the
   project owner can make.
 
-Phase 3, backtesting engine done: `rebalancer-backtest` (6 tests) +
-`rebalancer-oracle`'s new `market_chart` (2 tests). Verified live - `cargo
-run -p rebalancer-backtest --bin backtest -- 90` against real CoinGecko
-history for this project's 60/40 XLM/USDC, 500bps config produced 2
-rebalances, both triggered right at the threshold (e.g. XLM -5.22% /
-USDC +5.21%), confirming the replay matches `rebalancer-core`'s actual
-gate rather than drifting from it. Calendar/volatility-band strategy
-templates and cost-basis/lot tracking (Phase 3's other two items) not
-started yet.
+Phase 3, all three off-chain items done:
+- Backtesting engine: `rebalancer-backtest` + `rebalancer-oracle`'s
+  `market_chart`. Verified live - `cargo run -p rebalancer-backtest
+  --bin backtest -- 90` against real CoinGecko history for this
+  project's 60/40 XLM/USDC, 500bps config produced 2 rebalances, both
+  triggered right at the threshold (e.g. XLM -5.22% / USDC +5.21%),
+  confirming the replay matches `rebalancer-core`'s actual gate rather
+  than drifting from it.
+- Calendar + volatility-band strategy templates: `rebalancer_core::Strategy`
+  (`calendar_due`, `realized_volatility_bps`,
+  `volatility_adjusted_threshold_bps`, `needs_rebalance_per_asset`),
+  wired into `rebalancer-backtest`'s replay loop and selectable via the
+  CLI's second argument (`threshold` (default) | `calendar` |
+  `vol-band`). Verified live over 180 days of real XLM/USDC history:
+  threshold triggered 4 times at ~5% drift, calendar triggered 5 times
+  on a fixed 30-day cadence regardless of drift size, vol-band
+  triggered 10 times at a narrower ~2-3% effective threshold consistent
+  with the pair's realized volatility over the period. Both templates
+  exist only here so far - no on-chain representation yet, see
+  `contracts/contracts/strategy_registry`'s "not yet built" status in
+  PROJECT.md.
+- Cost-basis / tax-lot tracking: `rebalancer_core::dispose_fifo` (FIFO
+  lot matching, mirrors `crates/db`'s `lots` table convention), wired
+  into the backtester so every rebalance opens a lot for each
+  net-bought asset and disposes FIFO for each net-sold one, reporting
+  realized gain/loss per rebalance and as a report total. Verified live
+  over the same 180-day threshold run: rebalances that trimmed
+  appreciated XLM realized real gains (+$113.74, +$282.95), while ones
+  disposing of USDC (barely moves in price) realized near-zero
+  gain/loss (-$0.03, -$0.11) - matches the economics of what actually
+  happened. Not yet wired into `rebalancer-db`'s `lots` table for real
+  recording - no real caller exists yet (no router, so no real trade
+  ever executes), consistent with this backend's convention of adding
+  repository functions only once something actually needs them.
