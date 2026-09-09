@@ -270,6 +270,47 @@ fn realized_volatility_skips_non_positive_prices_instead_of_dividing_by_zero() {
 }
 
 #[test]
+fn dispose_fifo_consumes_oldest_lots_first_and_computes_gain_loss() {
+    let lots = vec![Lot { qty: 10, price: 100 }, Lot { qty: 5, price: 200 }];
+    let (result, remaining) = dispose_fifo(&lots, 12, 150).unwrap();
+
+    // Cost basis: all 10 units @100 (1000) + 2 units @200 (400) = 1400.
+    assert_eq!(result.qty_disposed, 12);
+    assert_eq!(result.cost_basis, 1_400);
+    assert_eq!(result.proceeds, 12 * 150);
+    assert_eq!(result.gain_loss, 12 * 150 - 1_400);
+    assert_eq!(remaining, vec![Lot { qty: 3, price: 200 }]);
+}
+
+#[test]
+fn dispose_fifo_exact_total_leaves_no_lots() {
+    let lots = vec![Lot { qty: 10, price: 100 }, Lot { qty: 5, price: 200 }];
+    let (_, remaining) = dispose_fifo(&lots, 15, 150).unwrap();
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn dispose_fifo_more_than_available_is_a_typed_error() {
+    let lots = vec![Lot { qty: 10, price: 100 }];
+    assert_eq!(dispose_fifo(&lots, 11, 150), Err(LotError::InsufficientLots));
+}
+
+#[test]
+fn dispose_fifo_zero_qty_is_a_no_op() {
+    let lots = vec![Lot { qty: 10, price: 100 }];
+    let (result, remaining) = dispose_fifo(&lots, 0, 150).unwrap();
+    assert_eq!(result.gain_loss, 0);
+    assert_eq!(remaining, lots);
+}
+
+#[test]
+fn dispose_fifo_at_a_loss_produces_negative_gain_loss() {
+    let lots = vec![Lot { qty: 10, price: 200 }];
+    let (result, _) = dispose_fifo(&lots, 10, 100).unwrap();
+    assert_eq!(result.gain_loss, -1_000);
+}
+
+#[test]
 fn volatility_adjusted_threshold_scales_with_volatility_and_clamps() {
     // 1:1 multiplier, mid-range volatility stays within the band.
     assert_eq!(volatility_adjusted_threshold_bps(300, BPS_DENOM as u32, 100, 2_000), 300);

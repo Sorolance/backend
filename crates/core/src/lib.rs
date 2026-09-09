@@ -224,5 +224,90 @@ pub fn volatility_adjusted_threshold_bps(
     (scaled as u32).clamp(min_threshold_bps, max_threshold_bps)
 }
 
+/// One cost-basis lot: `qty` of an asset acquired at `price` (same
+/// fixed-point convention as `AssetState::price` elsewhere in this
+/// crate). Ordering across a `Vec<Lot>` matters - `dispose_fifo` always
+/// consumes from the front, so callers must keep lots sorted
+/// oldest-acquired-first themselves; this type carries no timestamp of
+/// its own, mirroring `calendar_due` staying date-library-free for the
+/// same reason (see `crates/db`'s `lots` table migration, which does
+/// keep `acquired_at` for exactly this ordering, on the caller's side of
+/// that split).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lot {
+    pub qty: i128,
+    pub price: i128,
+}
+
+/// Realized gain/loss from one `dispose_fifo` call, in the same scaled
+/// units as `Lot::price` times `Lot::qty` (not necessarily USD - see
+/// `AssetPriceSeries`'s doc comment in `rebalancer-backtest` for the
+/// scaling convention a caller sourcing real prices should follow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RealizedGainLoss {
+    pub qty_disposed: i128,
+    pub proceeds: i128,
+    pub cost_basis: i128,
+    pub gain_loss: i128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LotError {
+    /// Asked to dispose more than the supplied lots actually cover - a
+    /// caller bug (tracking a sale larger than the tracked balance), not
+    /// a data condition worth silently clamping around.
+    InsufficientLots,
+}
+
+/// Matches `qty_to_dispose` against `lots` oldest-first (FIFO - the
+/// convention `crates/db`'s `lots` table migration already documents),
+/// returning the realized gain/loss at `disposal_price` and the lots
+/// left afterward (the consumed lot removed or reduced). Never mutates
+/// `lots` in place, so a caller unsure whether to commit a tentative
+/// disposal can just discard the result.
+pub fn dispose_fifo(
+    lots: &[Lot],
+    qty_to_dispose: i128,
+    disposal_price: i128,
+) -> Result<(RealizedGainLoss, Vec<Lot>), LotError> {
+    let mut remaining_to_dispose = qty_to_dispose;
+    let mut cost_basis: i128 = 0;
+    let mut remaining_lots = Vec::new();
+
+    for lot in lots {
+        if remaining_to_dispose <= 0 {
+            remaining_lots.push(*lot);
+            continue;
+        }
+        if lot.qty <= remaining_to_dispose {
+            cost_basis = cost_basis.saturating_add(lot.qty.saturating_mul(lot.price));
+            remaining_to_dispose -= lot.qty;
+        } else {
+            cost_basis =
+                cost_basis.saturating_add(remaining_to_dispose.saturating_mul(lot.price));
+            remaining_lots.push(Lot {
+                qty: lot.qty - remaining_to_dispose,
+                price: lot.price,
+            });
+            remaining_to_dispose = 0;
+        }
+    }
+
+    if remaining_to_dispose > 0 {
+        return Err(LotError::InsufficientLots);
+    }
+
+    let proceeds = qty_to_dispose.saturating_mul(disposal_price);
+    Ok((
+        RealizedGainLoss {
+            qty_disposed: qty_to_dispose,
+            proceeds,
+            cost_basis,
+            gain_loss: proceeds.saturating_sub(cost_basis),
+        },
+        remaining_lots,
+    ))
+}
+
 #[cfg(test)]
 mod test;
