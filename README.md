@@ -17,7 +17,7 @@ See [`../PROJECT.md`](../PROJECT.md) for the full project plan.
 | `crates/notify` | `rebalancer-notify` | HMAC-SHA256-signed webhook dispatch (`X-Rebalancer-Signature`, the Stripe/GitHub model). |
 | `crates/scheduler` | `rebalancer-scheduler` | Polls the vault for drift, computes and fee-gates rebalances, submits them, and dispatches notifications. The main service — see [Fee-aware execution](#fee-aware-execution) below. |
 | `crates/backtest` | `rebalancer-backtest` | Replays a strategy (threshold, calendar, or volatility-band) against historical daily prices, reusing `rebalancer-core`'s live decision logic, with FIFO cost-basis tracking. Ships as a CLI (`backtest`) pending the `api` crate. |
-| `crates/api` | `rebalancer-api` | HTTP layer for the frontend, covering sub-portfolios + audit log export, external trigger webhooks, and the what-if simulator: registers a portfolio whose vault the frontend has already deployed/initialized/keeper-authorized (never touches the chain itself), lists a wallet's portfolios, serves a CSV rebalance history export, registers outbound webhooks, accepts inbound trigger requests, and projects a price-shock's drift/trades from caller-supplied live balances/prices. The dashboard's live allocation/drift reads still go direct-to-contract — see [`../PROJECT.md`](../PROJECT.md). |
+| `crates/api` | `rebalancer-api` | HTTP layer for the frontend, covering sub-portfolios + audit log export, external trigger webhooks, the what-if simulator, and copy strategies: registers a portfolio whose vault the frontend has already deployed/initialized/keeper-authorized (never touches the chain itself), lists a wallet's portfolios, serves a CSV rebalance history export, registers outbound webhooks, accepts inbound trigger requests, projects a price-shock's drift/trades from caller-supplied live balances/prices, and publishes/browses anonymized public strategy templates. The dashboard's live allocation/drift reads still go direct-to-contract — see [`../PROJECT.md`](../PROJECT.md). |
 
 ## Fee-aware execution
 
@@ -97,6 +97,34 @@ weight/drift, whether a rebalance would trigger, and (if so) the trades
 that would fire — computed by `rebalancer_core::{compute_allocation,
 needs_rebalance, compute_rebalance_trades}` unchanged, the same functions
 the scheduler runs against real on-chain data every tick.
+
+## Copy strategies
+
+An owner can opt in to publish their portfolio's current target
+allocation as a public, anonymized template other users can browse and
+clone:
+
+```sh
+# Publish (name defaults to the portfolio's own name if omitted - pass
+# your own to avoid publishing under a potentially identifying one):
+curl -X POST http://localhost:8080/portfolios/<id>/publish-strategy \
+  -H 'content-type: application/json' \
+  -d '{"name": "70/30 conservative"}'
+
+# Browse:
+curl http://localhost:8080/strategy-templates
+curl http://localhost:8080/strategy-templates/<template-id>
+```
+
+A published template is a point-in-time snapshot (`targets` +
+`threshold_bps`) - it carries no `portfolio_id`, `vault_address`, or
+`owner_address`, so it can't be traced back to the source portfolio
+through the API or a raw `strategy_templates` read, and stays valid even
+if the source portfolio later changes its own targets. There's no
+"clone" endpoint of its own - a client fetches a template, then pre-fills
+the normal `POST /portfolios` create flow (after deploying and
+initializing a fresh vault the usual way) with its `targets`/
+`threshold_bps`.
 
 ## Getting Started
 
@@ -196,6 +224,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | 4 | Sub-portfolios, audit log export | Backend done (`rebalancer-api`, integration-tested against real Postgres) — frontend integration not started |
 | 5 | External trigger webhooks | Done — `rebalancer-api` (register + inbound trigger, integration-tested) and `rebalancer-scheduler` (fast trigger poll + fee-aware override, unit-tested); not yet live-verified against a real deployed instance |
 | 5 | What-if simulator | Done — `rebalancer-api`'s `/simulate`, integration-tested and live-verified against a running instance (on-target no-op, a shocked-drift case projecting the correct trade, and a missing-input 400) |
+| 5 | Copy strategies | Done — `rebalancer-api`'s publish/browse endpoints, integration-tested and live-verified (published, listed, fetched, and confirmed the response never carries owner/vault identifiers) |
 
 See [`../PROJECT.md`](../PROJECT.md) for the full build log and every
 live-network verification behind these results.

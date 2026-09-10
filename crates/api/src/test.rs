@@ -480,6 +480,118 @@ async fn simulate_missing_an_assets_balance_is_rejected_with_400() {
 }
 
 #[tokio::test]
+async fn publish_strategy_then_list_and_get_it_with_no_portfolio_linkage() {
+    let pool = test_pool().await;
+    let (id, portfolio_id) = register_portfolio(&pool).await;
+
+    let response = build_router(pool.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/portfolios/{id}/publish-strategy"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::json!({"name": "60/40 starter"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let published = body_json(response).await;
+    assert_eq!(published["name"], "60/40 starter");
+    assert_eq!(published["threshold_bps"], 500);
+    assert_eq!(published["targets"].as_array().unwrap().len(), 2);
+    // Anonymized: nothing in the response ties back to the source portfolio.
+    assert!(published.get("portfolio_id").is_none());
+    assert!(published.get("vault_address").is_none());
+    assert!(published.get("owner_address").is_none());
+    let template_id = published["id"].as_str().unwrap().to_string();
+
+    let response = build_router(pool.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/strategy-templates")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed = body_json(response).await;
+    assert!(listed.as_array().unwrap().iter().any(|t| t["id"] == template_id));
+
+    let response = build_router(pool.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/strategy-templates/{template_id}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let fetched = body_json(response).await;
+    assert_eq!(fetched["name"], "60/40 starter");
+
+    sqlx::query("DELETE FROM strategy_templates WHERE id = $1::uuid")
+        .bind(&template_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn publish_strategy_with_no_name_falls_back_to_the_portfolio_name() {
+    let pool = test_pool().await;
+    let (id, portfolio_id) = register_portfolio(&pool).await;
+
+    let response = build_router(pool.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/portfolios/{id}/publish-strategy"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let published = body_json(response).await;
+    assert_eq!(published["name"], "api test portfolio");
+
+    sqlx::query("DELETE FROM strategy_templates WHERE id = $1::uuid")
+        .bind(published["id"].as_str().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn get_unknown_strategy_template_returns_404() {
+    let pool = test_pool().await;
+    let response = build_router(pool)
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/strategy-templates/{}", Uuid::new_v4()))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn get_unknown_portfolio_returns_404() {
     let pool = test_pool().await;
     let response = build_router(pool)

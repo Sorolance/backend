@@ -466,6 +466,40 @@ async fn claim_pending_external_trigger_claims_oldest_unprocessed_then_stops() {
 }
 
 #[tokio::test]
+async fn insert_strategy_template_then_list_and_get_round_trip() {
+    let pool = test_pool().await;
+    let targets = serde_json::json!([
+        {"asset": "CASSET_XLM", "price_asset_kind": "other", "price_asset_value": "XLM", "weight_bps": 6000},
+        {"asset": "CASSET_USDC", "price_asset_kind": "other", "price_asset_value": "USDC", "weight_bps": 4000},
+    ]);
+    let template = insert_strategy_template(&pool, "60/40 XLM-USDC", 500, targets.clone())
+        .await
+        .expect("insert strategy template");
+    assert_eq!(template.name, "60/40 XLM-USDC");
+    assert_eq!(template.targets, targets);
+
+    let listed = list_strategy_templates(&pool).await.expect("list strategy templates");
+    assert!(listed.iter().any(|t| t.id == template.id));
+
+    let fetched = get_strategy_template(&pool, template.id)
+        .await
+        .expect("get strategy template")
+        .expect("template exists");
+    assert_eq!(fetched.id, template.id);
+
+    assert!(get_strategy_template(&pool, Uuid::new_v4())
+        .await
+        .expect("get unknown template")
+        .is_none());
+
+    sqlx::query("DELETE FROM strategy_templates WHERE id = $1")
+        .bind(template.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn list_active_webhooks_filters_by_event_type_and_active_flag() {
     let pool = test_pool().await;
     let vault_address = format!("CTEST{}", Uuid::new_v4().simple());

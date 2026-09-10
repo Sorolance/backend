@@ -8,11 +8,13 @@
 //! repo's `vault::initialize`, which requires `owner.require_auth()`),
 //! listing a wallet's portfolios for the dashboard, and exporting one
 //! portfolio's on-chain rebalance history as a CSV audit log. Also covers
-//! external trigger webhooks and the what-if simulator, neither of which
-//! needs chain access either - `/simulate` takes the caller's own live
-//! balances/prices as input (the frontend already has them, reading the
-//! contract directly for the dashboard - see `PROJECT.md` section 6)
-//! rather than this crate fetching them itself, preserving the
+//! external trigger webhooks, the what-if simulator, and copy strategies,
+//! none of which need chain access either - `/simulate` takes the
+//! caller's own live balances/prices as input (the frontend already has
+//! them, reading the contract directly for the dashboard - see
+//! `PROJECT.md` section 6) rather than this crate fetching them itself,
+//! and a published strategy template is a point-in-time snapshot of
+//! `targets`, never a live reference back to the chain, preserving the
 //! never-touches-the-chain boundary above.
 
 use axum::{
@@ -24,9 +26,10 @@ use axum::{
     Json, Router,
 };
 use rebalancer_db::{
-    get_portfolio, insert_external_trigger, insert_portfolio_with_targets, insert_webhook,
-    list_active_webhooks_for_portfolio, list_portfolios_by_owner, list_rebalance_events,
-    list_targets, NewTarget, PgPool, Portfolio, Target, Uuid, Webhook,
+    get_portfolio, get_strategy_template, insert_external_trigger, insert_portfolio_with_targets,
+    insert_strategy_template, insert_webhook, list_active_webhooks_for_portfolio,
+    list_portfolios_by_owner, list_rebalance_events, list_strategy_templates, list_targets,
+    NewTarget, PgPool, Portfolio, StrategyTemplate, Target, Uuid, Webhook,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -40,6 +43,9 @@ pub fn build_router(pool: PgPool) -> Router {
         .route("/portfolios/:id/webhooks", post(create_webhook))
         .route("/portfolios/:id/trigger", post(trigger_portfolio))
         .route("/portfolios/:id/simulate", post(simulate_portfolio))
+        .route("/portfolios/:id/publish-strategy", post(publish_strategy))
+        .route("/strategy-templates", get(list_strategies))
+        .route("/strategy-templates/:id", get(get_strategy))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(pool)
 }
@@ -530,6 +536,94 @@ async fn simulate_portfolio(
         allocation: allocation.into_iter().map(Into::into).collect(),
         trades: trades.into_iter().map(Into::into).collect(),
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct PublishStrategyRequest {
+    /// Overrides the published template's name - defaults to the
+    /// portfolio's own `name` if omitted or empty. Letting the caller
+    /// override it matters for anonymization: a portfolio's own name
+    /// ("My Retirement Fund") can be identifying in a way a template
+    /// name doesn't need to be.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct StrategyTemplateResponse {
+    id: Uuid,
+    name: String,
+    threshold_bps: i32,
+    targets: serde_json::Value,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<StrategyTemplate> for StrategyTemplateResponse {
+    fn from(t: StrategyTemplate) -> Self {
+        Self { id: t.id, name: t.name, threshold_bps: t.threshold_bps, targets: t.targets, created_at: t.created_at }
+    }
+}
+
+/// Copy strategies (PROJECT.md differentiator #10), publish half:
+/// snapshots a portfolio's current `targets` + `threshold_bps` into a
+/// new, anonymized `strategy_templates` row - opt-in only, this is never
+/// called automatically. No `owner_address`/`vault_address`/
+/// `portfolio_id` is carried into the snapshot (see this module's own
+/// doc comment and the migration's), so the resulting template can't be
+/// traced back to this portfolio through the API or a raw table read.
+async fn publish_strategy(
+    State(pool): State<PgPool>,
+    Path(portfolio_id): Path<Uuid>,
+    Json(req): Json<PublishStrategyRequest>,
+) -> Result<(StatusCode, Json<StrategyTemplateResponse>), ApiError> {
+    let portfolio = get_portfolio(&pool, portfolio_id).await?.ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "portfolio not found".into(),
+    })?;
+    let targets = list_targets(&pool, portfolio_id).await?;
+    if targets.is_empty() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "portfolio has no targets to publish".into(),
+        });
+    }
+
+    let name = req.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| portfolio.name.clone());
+    let targets_json = serde_json::json!(targets
+        .iter()
+        .map(|t| serde_json::json!({
+            "asset": t.asset,
+            "price_asset_kind": t.price_asset_kind,
+            "price_asset_value": t.price_asset_value,
+            "weight_bps": t.weight_bps,
+        }))
+        .collect::<Vec<_>>());
+
+    let template = insert_strategy_template(&pool, &name, portfolio.threshold_bps, targets_json).await?;
+    Ok((StatusCode::CREATED, Json(template.into())))
+}
+
+/// Copy strategies, browse half: every published template, newest first.
+/// "Clone" itself needs no endpoint of its own - a client fetches this
+/// list (or one template via the route below), then pre-fills its
+/// existing create-portfolio flow (`POST /portfolios`, after deploying
+/// and initializing a fresh vault the normal way) with the chosen
+/// template's `targets`/`threshold_bps`. There's no live link between a
+/// clone and the template it came from.
+async fn list_strategies(State(pool): State<PgPool>) -> Result<Json<Vec<StrategyTemplateResponse>>, ApiError> {
+    let rows = list_strategy_templates(&pool).await?;
+    Ok(Json(rows.into_iter().map(Into::into).collect()))
+}
+
+async fn get_strategy(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<StrategyTemplateResponse>, ApiError> {
+    let template = get_strategy_template(&pool, id).await?.ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "strategy template not found".into(),
+    })?;
+    Ok(Json(template.into()))
 }
 
 #[cfg(test)]

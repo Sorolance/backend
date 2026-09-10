@@ -423,5 +423,56 @@ pub async fn claim_pending_external_trigger(
     Ok(Some(claimed))
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct StrategyTemplate {
+    pub id: Uuid,
+    pub name: String,
+    pub threshold_bps: i32,
+    /// Same shape as a `NewTarget` array - see the `strategy_templates`
+    /// migration's doc comment for why this stays JSONB rather than its
+    /// own row-per-target table.
+    pub targets: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Publishes a snapshot of `targets` as a public strategy template
+/// (PROJECT.md differentiator #10) - opt-in only, never automatic, and
+/// deliberately anonymized: no portfolio/vault/owner reference is stored
+/// anywhere in this row, just the target weights and threshold
+/// themselves, as of the moment of publishing.
+pub async fn insert_strategy_template(
+    pool: &PgPool,
+    name: &str,
+    threshold_bps: i32,
+    targets: serde_json::Value,
+) -> Result<StrategyTemplate, sqlx::Error> {
+    sqlx::query_as(
+        "INSERT INTO strategy_templates (name, threshold_bps, targets)
+         VALUES ($1, $2, $3)
+         RETURNING *",
+    )
+    .bind(name)
+    .bind(threshold_bps)
+    .bind(targets)
+    .fetch_one(pool)
+    .await
+}
+
+/// Every published template, newest first - what the "browse" list
+/// queries by. Unfiltered and unpaginated for now, same scope as
+/// `list_portfolios`.
+pub async fn list_strategy_templates(pool: &PgPool) -> Result<Vec<StrategyTemplate>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM strategy_templates ORDER BY created_at DESC")
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn get_strategy_template(pool: &PgPool, id: Uuid) -> Result<Option<StrategyTemplate>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM strategy_templates WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
 #[cfg(test)]
 mod test;
