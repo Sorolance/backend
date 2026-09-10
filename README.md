@@ -40,12 +40,15 @@ Rust/axum backend. See `../PROJECT.md` for the full project plan.
   a decision only the project owner can make.
 
 - `crates/scheduler` (package `rebalancer-scheduler`) — polls the deployed
-  `vault` contract for drift on an interval and submits a keeper-signed
-  `rebalance` when it's above threshold, dispatching a
-  `rebalance.completed` webhook on every genuinely new one recorded; also
-  calls `vault::observe_risk` each tick regardless of whether a rebalance
-  is imminent, dispatching `risk.circuit_breaker_tripped` if that call
-  just tripped it; also polls both `rebalancer-oracle` sources for every
+  `vault` contract for drift on an interval and, once it's above
+  threshold, computes the real trades needed to reach target, quotes each
+  one against the deployed `router`, and submits a keeper-signed
+  `rebalance` only if that's actually worth doing right now - fee-aware
+  execution (Phase 4), see below - dispatching a `rebalance.completed`
+  webhook on every genuinely new one recorded; also calls
+  `vault::observe_risk` each tick regardless of whether a rebalance is
+  imminent, dispatching `risk.circuit_breaker_tripped` if that call just
+  tripped it; also polls both `rebalancer-oracle` sources for every
   configured asset each tick, records both into `price_snapshots`, and
   logs a warning if they've diverged past a configurable threshold
   (`PRICE_DIVERGENCE_WARN_BPS`). Shells out to the `stellar` CLI
@@ -56,6 +59,48 @@ Rust/axum backend. See `../PROJECT.md` for the full project plan.
   `tokio-cron-scheduler` originally sketched below - simpler, and a fixed
   interval is all Phase 1/2 actually needs; cron-style scheduling can come
   back if a real need for it (e.g. per-strategy schedules) shows up.
+
+  **Fee-aware execution (Phase 4).** Before Phase 4, every `rebalance`
+  call submitted `trades = []` regardless of drift - a real gap this item
+  closed, not just an add-on: `run_once` now reads
+  `vault::compute_allocation` for the live target weights + drift, fetches
+  each target asset's real balance (`chain::token_balance`, SEP-41
+  `balance`) and oracle price, and feeds them into
+  `rebalancer_core::compute_rebalance_trades` to get the actual
+  `TradeIntent`s needed to reach target - the same drift math `vault`
+  itself enforces, generalized to emit real trades instead of just a
+  boolean. Each trade is quoted for real against the router
+  (`chain::quote_swap`), and its slippage vs. the oracle-implied fair
+  price (`rebalancer_core::slippage_bps`) plus the live network fee
+  (`chain::fee_stats`, Stellar's `p99` Soroban inclusion fee, converted to
+  value terms via XLM's own price) combine into a total cost in bps of the
+  trade's value (`rebalancer_core::total_cost_bps`). A rebalance whose
+  worst-asset drift is far enough past threshold
+  (`URGENT_DRIFT_MULTIPLIER`, default 2x) executes regardless of cost;
+  otherwise it only executes if that cost is within
+  `MAX_REBALANCE_COST_BPS` (default 50 bps), deferring to the next tick if
+  not - the drift isn't lost, it's just re-evaluated next time, often
+  cheaper (a calmer market) or urgent enough to override cost by then.
+  "Batch small rebalances" (the other half of this PROJECT.md item) needs
+  no separate logic: every trade `compute_rebalance_trades` returns for a
+  tick already submits together in `vault::rebalance`'s one call, one
+  network fee.
+
+  Verified live against the deployed testnet vault: deposited a real,
+  deliberately skewed 66/34 XLM/USDC split (630bps drift - past the 500bps
+  threshold, but under the 1,000bps urgent line), and confirmed the
+  computed single trade's real router quote showed ~50% slippage against
+  the router's genuinely thin liquidity (its actual real-money constraint
+  from the Phase 4 router work, not a fabricated test condition) -
+  `total_cost_bps` came back ~5,038-5,052 across two runs, correctly
+  deferred at the default 50bps budget (`deferring rebalance to next
+  tick: not urgent and too costly right now`), then correctly executed
+  once `MAX_REBALANCE_COST_BPS` was raised past that cost
+  (`executing fee-aware rebalance ... urgent=false trades=1`) - a real
+  signed `rebalance` landed on-chain, and the *next* tick's
+  `compute_allocation` confirmed drift had actually dropped to ~194bps,
+  under threshold (`drift below threshold, nothing to do`). Withdrew the
+  test deposit back out afterward, confirmed the vault is empty again.
 
 - `crates/backtest` (package `rebalancer-backtest`) — replays the
   threshold strategy against historical daily prices, reusing
@@ -89,13 +134,15 @@ cp ../.env.example ../.env   # fill in KEEPER_IDENTITY/KEEPER_ADDRESS above
 cargo run -p rebalancer-scheduler --bin rebalancer-scheduler
 ```
 
-Until Phase 4 wires a router, every attempted `rebalance` fails closed
-with `RouterNotConfigured` - that's expected, logged as a warning, and
-does not crash the loop. See `crates/scheduler/src/lib.rs` for a known
-on-chain quirk this surfaced: `needs_rebalance` currently reads an empty
-vault as needing a rebalance too, so an empty/unfunded vault will show up
-here as constantly "due" - harmless today, worth fixing in `contracts`
-before Phase 4.
+Now that `ROUTER_CONTRACT_ID` is required and fee-aware execution
+computes and submits real trades (see above), a rebalance only fails
+closed with `RouterNotConfigured` if `set_router` was never called for
+this vault - genuinely misconfigured, not the expected steady state
+anymore. See `crates/scheduler/src/lib.rs` for a known on-chain quirk
+still worth fixing in `contracts`, unrelated to fee-aware execution:
+`needs_rebalance` currently reads a *totally empty* vault (zero balance in
+every asset) as needing a rebalance too, so an unfunded vault will show up
+here as constantly "due" until it's ever deposited into.
 
 Each tick also polls Reflector (via `ORACLE_ADAPTER_CONTRACT_ID`) and
 CoinGecko for every asset in `crates/scheduler/src/pricing.rs`'s fixed
@@ -147,10 +194,8 @@ Phase 0 (foundations) done: `rebalancer-core` (13 tests) and `rebalancer-db`
 
 Phase 1: `rebalancer-scheduler` done and verified live against the
 deployed testnet vault (keeper authorized via `set_keeper`, drift
-detection and rebalance submission both confirmed working end-to-end;
-every submission currently fails closed with `RouterNotConfigured` since
-no router exists yet - see above). No API yet - the frontend still reads
-the contract directly.
+detection and rebalance submission both confirmed working end-to-end). No
+API yet - the frontend still reads the contract directly.
 
 Phase 2, all three items done:
 - Pricing: `rebalancer-oracle` (10 tests), wired into the scheduler's
@@ -200,6 +245,16 @@ Phase 3, all three off-chain items done:
   disposing of USDC (barely moves in price) realized near-zero
   gain/loss (-$0.03, -$0.11) - matches the economics of what actually
   happened. Not yet wired into `rebalancer-db`'s `lots` table for real
-  recording - no real caller exists yet (no router, so no real trade
-  ever executes), consistent with this backend's convention of adding
-  repository functions only once something actually needs them.
+  recording - no real caller wires it up yet (real trades do execute now,
+  see the Phase 4 note below, but `run_once` doesn't record cost-basis
+  lots for them - that's separate, still-unstarted work), consistent with
+  this backend's convention of adding repository functions only once
+  something actually needs them.
+
+Phase 4 (backend half): fee-aware execution done - see the
+`crates/scheduler` bullet above for what it does and its live
+verification (real deposit, real quote, real deferral at the default cost
+budget, real execution once raised, real on-chain drift drop confirmed on
+the following tick, real withdrawal back out). Sub-portfolios and audit
+log export remain, along with the `contracts` repo's still-open
+empty-vault `needs_rebalance` quirk noted above.

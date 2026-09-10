@@ -1230,9 +1230,11 @@ version = "0.1.0"
 dependencies = [
  "bigdecimal",
  "chrono",
+ "rebalancer-core",
  "rebalancer-db",
  "rebalancer-notify",
  "rebalancer-oracle",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

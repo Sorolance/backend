@@ -320,3 +320,98 @@ fn volatility_adjusted_threshold_scales_with_volatility_and_clamps() {
     // A wildly volatile asset is capped at the maximum.
     assert_eq!(volatility_adjusted_threshold_bps(50_000, BPS_DENOM as u32, 100, 2_000), 2_000);
 }
+
+#[test]
+fn compute_rebalance_trades_on_target_emits_nothing() {
+    let states = vec![
+        AssetState { asset: "XLM", balance: 60, price: 1 },
+        AssetState { asset: "USDC", balance: 40, price: 1 },
+    ];
+    assert_eq!(compute_rebalance_trades(&targets(), &states), vec![]);
+}
+
+#[test]
+fn compute_rebalance_trades_single_source_single_sink() {
+    let states = vec![
+        AssetState { asset: "XLM", balance: 100, price: 1 },
+        AssetState { asset: "USDC", balance: 0, price: 1 },
+    ];
+    assert_eq!(
+        compute_rebalance_trades(&targets(), &states),
+        vec![TradeIntent { asset_in: "XLM", asset_out: "USDC", amount_in: 40 }]
+    );
+}
+
+#[test]
+fn compute_rebalance_trades_splits_one_source_across_two_sinks() {
+    let three_way = vec![
+        TargetWeight { asset: "A", weight_bps: 5_000 },
+        TargetWeight { asset: "B", weight_bps: 3_000 },
+        TargetWeight { asset: "C", weight_bps: 2_000 },
+    ];
+    let states = vec![
+        AssetState { asset: "A", balance: 100, price: 1 },
+        AssetState { asset: "B", balance: 0, price: 1 },
+        AssetState { asset: "C", balance: 0, price: 1 },
+    ];
+    assert_eq!(
+        compute_rebalance_trades(&three_way, &states),
+        vec![
+            TradeIntent { asset_in: "A", asset_out: "B", amount_in: 30 },
+            TradeIntent { asset_in: "A", asset_out: "C", amount_in: 20 },
+        ]
+    );
+}
+
+#[test]
+fn compute_rebalance_trades_empty_portfolio_emits_nothing() {
+    let states: Vec<AssetState<&str>> = vec![];
+    assert_eq!(compute_rebalance_trades(&targets(), &states), vec![]);
+}
+
+#[test]
+fn slippage_bps_measures_shortfall_against_fair_oracle_price() {
+    // 40 XLM at parity prices should fairly yield 40 units; a router
+    // quote of 38 is 5% short.
+    assert_eq!(slippage_bps(40, 1, 1, 38), 500);
+}
+
+#[test]
+fn slippage_bps_floors_at_zero_when_quote_meets_or_beats_fair_value() {
+    assert_eq!(slippage_bps(40, 1, 1, 40), 0);
+    assert_eq!(slippage_bps(40, 1, 1, 41), 0);
+}
+
+#[test]
+fn total_cost_bps_combines_fee_and_slippage() {
+    assert_eq!(total_cost_bps(10_000, 10, 25), 35);
+}
+
+#[test]
+fn total_cost_bps_is_maximal_for_nonpositive_trade_value() {
+    assert_eq!(total_cost_bps(0, 10, 25), u32::MAX);
+}
+
+#[test]
+fn fee_aware_execution_urgent_drift_overrides_cost() {
+    let decision = evaluate_fee_aware_execution(1_200, 500, 2, 999, 50);
+    assert_eq!(decision, FeeAwareDecision { execute: true, urgent: true, total_cost_bps: 999 });
+}
+
+#[test]
+fn fee_aware_execution_defers_non_urgent_expensive_rebalance() {
+    let decision = evaluate_fee_aware_execution(600, 500, 2, 80, 50);
+    assert_eq!(decision, FeeAwareDecision { execute: false, urgent: false, total_cost_bps: 80 });
+}
+
+#[test]
+fn fee_aware_execution_executes_non_urgent_cheap_rebalance() {
+    let decision = evaluate_fee_aware_execution(600, 500, 2, 40, 50);
+    assert_eq!(decision, FeeAwareDecision { execute: true, urgent: false, total_cost_bps: 40 });
+}
+
+#[test]
+fn fee_aware_execution_zero_multiplier_disables_urgency_override() {
+    let decision = evaluate_fee_aware_execution(5_000, 500, 0, 80, 50);
+    assert_eq!(decision, FeeAwareDecision { execute: false, urgent: false, total_cost_bps: 80 });
+}

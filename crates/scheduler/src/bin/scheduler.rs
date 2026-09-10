@@ -6,7 +6,7 @@ use rebalancer_oracle::coingecko::CoinGeckoClient;
 use rebalancer_oracle::on_chain::OnChainPriceReader;
 use rebalancer_scheduler::chain::ChainClient;
 use rebalancer_scheduler::pricing::observe_market_prices;
-use rebalancer_scheduler::{config::Config, observe_risk_once, run_once};
+use rebalancer_scheduler::{config::Config, observe_risk_once, run_once, FeeAwareConfig};
 use tracing::{error, info};
 
 #[tokio::main]
@@ -48,6 +48,7 @@ async fn main() {
         vault_contract_id: config.vault_contract_id.clone(),
         keeper_identity: config.keeper_identity.clone(),
         keeper_address: config.keeper_address.clone(),
+        router_contract_id: config.router_contract_id.clone(),
     };
     let on_chain_prices = OnChainPriceReader {
         stellar_cli: config.stellar_cli.clone(),
@@ -60,6 +61,11 @@ async fn main() {
     };
     let coingecko = CoinGeckoClient::new();
     let webhook_client = WebhookClient::new();
+    let fee_aware = FeeAwareConfig {
+        max_cost_bps: config.max_rebalance_cost_bps,
+        urgent_drift_multiplier: config.urgent_drift_multiplier,
+        execution_slippage_buffer_bps: config.execution_slippage_buffer_bps,
+    };
 
     info!(
         portfolio_id = %portfolio.id,
@@ -92,7 +98,17 @@ async fn main() {
         {
             error!(error = %e, "risk observation tick failed");
         }
-        if let Err(e) = run_once(&pool, &chain, &webhook_client, portfolio.id).await {
+        if let Err(e) = run_once(
+            &pool,
+            &chain,
+            &on_chain_prices,
+            &webhook_client,
+            portfolio.id,
+            config.threshold_bps as u32,
+            &fee_aware,
+        )
+        .await
+        {
             error!(error = %e, "tick failed");
         }
     }

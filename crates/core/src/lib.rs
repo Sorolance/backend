@@ -224,6 +224,175 @@ pub fn volatility_adjusted_threshold_bps(
     (scaled as u32).clamp(min_threshold_bps, max_threshold_bps)
 }
 
+/// One trade needed to move `asset_in` value into `asset_out`, in
+/// `asset_in`'s own native units - what `compute_rebalance_trades` emits
+/// and the shape a caller (the scheduler) turns into a `vault::rebalance`
+/// `TradeInstruction` once it's added a `min_amount_out` from a real
+/// router quote (this crate stays oracle/router-agnostic, so it has no
+/// opinion on slippage tolerance - see `slippage_bps`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TradeIntent<Asset> {
+    pub asset_in: Asset,
+    pub asset_out: Asset,
+    pub amount_in: i128,
+}
+
+/// Computes the trades needed to bring every asset back to target, given
+/// live balances/prices - the multi-asset generalization of "sell the
+/// overweight asset, buy the underweight one" that `vault::rebalance`
+/// itself has no opinion on (it just executes whatever `TradeInstruction`s
+/// it's handed - see the `contracts` repo). Overweight assets (`value >
+/// target_value`) are sources, underweight ones are sinks; each source's
+/// excess value is allocated across sinks in the order both appear in
+/// `targets`, greedily filling one sink before moving to the next, until
+/// every source and sink is exhausted. An asset can only ever be a source,
+/// a sink, or exactly on target - never both - so this never emits a
+/// self-trade. `amount_in` is `matched_value / price`, floor division: the
+/// vault only ever needs to move at most its actual excess, so
+/// undershooting the ideal split by a rounding remainder is harmless;
+/// overshooting isn't possible this way. A source whose price is 0
+/// (unpriced/misconfigured) is skipped entirely rather than dividing by
+/// it, consistent with `compute_allocation`'s own leniency toward missing
+/// price/balance data.
+pub fn compute_rebalance_trades<Asset: Clone + PartialEq>(
+    targets: &[TargetWeight<Asset>],
+    states: &[AssetState<Asset>],
+) -> Vec<TradeIntent<Asset>> {
+    struct Entry<A> {
+        asset: A,
+        price: i128,
+        excess_value: i128,
+    }
+
+    let values_and_prices: Vec<(Asset, i128, i128)> = targets
+        .iter()
+        .map(|t| {
+            let (balance, price) = states
+                .iter()
+                .find(|s| s.asset == t.asset)
+                .map(|s| (s.balance, s.price))
+                .unwrap_or((0, 0));
+            (t.asset.clone(), balance.saturating_mul(price), price)
+        })
+        .collect();
+    let total_value: i128 = values_and_prices
+        .iter()
+        .fold(0i128, |acc, (_, v, _)| acc.saturating_add(*v));
+
+    let mut entries: Vec<Entry<Asset>> = targets
+        .iter()
+        .zip(values_and_prices)
+        .map(|(t, (asset, value, price))| {
+            let target_value = total_value.saturating_mul(t.weight_bps as i128) / BPS_DENOM;
+            Entry {
+                asset,
+                price,
+                excess_value: value - target_value,
+            }
+        })
+        .collect();
+
+    let mut trades = Vec::new();
+    let mut source_idx = 0;
+    let mut sink_idx = 0;
+    while source_idx < entries.len() && sink_idx < entries.len() {
+        if entries[source_idx].excess_value <= 0 || entries[source_idx].price <= 0 {
+            source_idx += 1;
+            continue;
+        }
+        if entries[sink_idx].excess_value >= 0 {
+            sink_idx += 1;
+            continue;
+        }
+        let deficit = -entries[sink_idx].excess_value;
+        let matched_value = entries[source_idx].excess_value.min(deficit);
+        let amount_in = matched_value / entries[source_idx].price;
+        if amount_in > 0 {
+            trades.push(TradeIntent {
+                asset_in: entries[source_idx].asset.clone(),
+                asset_out: entries[sink_idx].asset.clone(),
+                amount_in,
+            });
+        }
+        entries[source_idx].excess_value -= matched_value;
+        entries[sink_idx].excess_value += matched_value;
+    }
+    trades
+}
+
+/// bps by which a router's quoted `amount_out` for `amount_in` falls short
+/// of the oracle-implied "fair" amount out at the same instant - the
+/// AMM's real price impact (plus its own swap fee, which is an equally
+/// real cost of executing the trade) for this trade size against current
+/// liquidity. `price_in`/`price_out` must share `AssetState::price`'s
+/// convention. Returns 0 rather than a negative bps if the quote is at or
+/// above fair value (possible with rounding, or a pool briefly favoring
+/// the trader) - "no measurable slippage" is the right floor, not a
+/// negative cost.
+pub fn slippage_bps(amount_in: i128, price_in: i128, price_out: i128, quoted_amount_out: i128) -> u32 {
+    if amount_in <= 0 || price_in <= 0 || price_out <= 0 {
+        return 0;
+    }
+    let fair_amount_out = amount_in.saturating_mul(price_in) / price_out;
+    if fair_amount_out <= 0 || quoted_amount_out >= fair_amount_out {
+        return 0;
+    }
+    let shortfall = fair_amount_out - quoted_amount_out;
+    let bps = shortfall.saturating_mul(BPS_DENOM) / fair_amount_out;
+    bps.clamp(0, u32::MAX as i128) as u32
+}
+
+/// Total expected cost of executing a rebalance, in bps of `trade_value` -
+/// the network fee (already converted by the caller into the same value
+/// units as `trade_value`, e.g. `fee_in_native_units * xlm_price`) plus
+/// the worst per-trade `slippage_bps` observed across the batch. `<= 0`
+/// trade value can't amortize any cost over it (nothing to divide by, and
+/// it shouldn't happen for a real rebalance) - treated as maximally
+/// expensive rather than dividing by zero, so a caller's cost gate always
+/// rejects it rather than silently passing.
+pub fn total_cost_bps(trade_value: i128, network_fee_value: i128, worst_slippage_bps: u32) -> u32 {
+    if trade_value <= 0 {
+        return u32::MAX;
+    }
+    let fee_bps = (network_fee_value.saturating_mul(BPS_DENOM) / trade_value).clamp(0, u32::MAX as i128) as u32;
+    fee_bps.saturating_add(worst_slippage_bps)
+}
+
+/// Whether a rebalance that's already past its drift threshold should
+/// actually execute now, or be deferred to the next tick because it's not
+/// urgent and costs too much relative to its own value right now (fees
+/// spiking, or a router quote showing heavy slippage) - PROJECT.md's
+/// "fee-aware execution" item. `urgent_drift_multiplier` makes urgency
+/// override cost entirely: once drift reaches `threshold_bps *
+/// urgent_drift_multiplier`, the portfolio is far enough off target that
+/// waiting for cheaper conditions risks drifting further, so it executes
+/// regardless of `total_cost_bps`. A multiplier of 0 disables the override
+/// (cost always gates execution); note the deferred trade isn't lost - the
+/// same drift (or more) will still be there next tick, still gated the
+/// same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeAwareDecision {
+    pub execute: bool,
+    pub urgent: bool,
+    pub total_cost_bps: u32,
+}
+
+pub fn evaluate_fee_aware_execution(
+    max_drift_bps: u32,
+    threshold_bps: u32,
+    urgent_drift_multiplier: u32,
+    total_cost_bps: u32,
+    max_cost_bps: u32,
+) -> FeeAwareDecision {
+    let urgent = urgent_drift_multiplier > 0
+        && max_drift_bps as u64 >= threshold_bps as u64 * urgent_drift_multiplier as u64;
+    FeeAwareDecision {
+        execute: urgent || total_cost_bps <= max_cost_bps,
+        urgent,
+        total_cost_bps,
+    }
+}
+
 /// One cost-basis lot: `qty` of an asset acquired at `price` (same
 /// fixed-point convention as `AssetState::price` elsewhere in this
 /// crate). Ordering across a `Vec<Lot>` matters - `dispose_fifo` always

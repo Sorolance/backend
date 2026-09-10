@@ -44,6 +44,26 @@ pub struct Config {
     /// `rebalancer_oracle`'s crate doc comment for why) - nothing acts on
     /// this beyond a log line.
     pub price_divergence_warn_bps: u32,
+    /// The deployed `router` (see PROJECT.md's deployment table) -
+    /// required for fee-aware execution's `quote_swap`, same as
+    /// `vault::rebalance` itself fails closed with `RouterNotConfigured`
+    /// without one wired in via `set_router`.
+    pub router_contract_id: String,
+    /// Fee-aware execution's cost budget: a rebalance that's past
+    /// threshold but not urgent only executes if its estimated network
+    /// fee + slippage stays within this many bps of the trade's own
+    /// value - see `rebalancer_core::evaluate_fee_aware_execution`.
+    pub max_rebalance_cost_bps: u32,
+    /// Once the worst per-asset drift reaches `threshold_bps *
+    /// urgent_drift_multiplier`, a rebalance executes regardless of cost -
+    /// see `evaluate_fee_aware_execution`'s doc comment for why waiting
+    /// indefinitely for cheaper conditions isn't safe once drift is this
+    /// far gone.
+    pub urgent_drift_multiplier: u32,
+    /// Headroom subtracted from a fresh router quote before it's sent
+    /// on-chain as a trade's `min_amount_out`, protecting against reserves
+    /// moving between the quote and the transaction landing.
+    pub execution_slippage_buffer_bps: u32,
 }
 
 #[derive(Debug)]
@@ -84,6 +104,10 @@ impl Config {
             poll_interval_secs: parse_optional("POLL_INTERVAL_SECS", 300)?,
             oracle_adapter_contract_id: require("ORACLE_ADAPTER_CONTRACT_ID")?,
             price_divergence_warn_bps: parse_optional("PRICE_DIVERGENCE_WARN_BPS", 300)?,
+            router_contract_id: require("ROUTER_CONTRACT_ID")?,
+            max_rebalance_cost_bps: parse_optional("MAX_REBALANCE_COST_BPS", 50)?,
+            urgent_drift_multiplier: parse_optional("URGENT_DRIFT_MULTIPLIER", 2)?,
+            execution_slippage_buffer_bps: parse_optional("EXECUTION_SLIPPAGE_BUFFER_BPS", 50)?,
         })
     }
 }

@@ -24,6 +24,18 @@ pub struct AssetConfig {
     pub price_asset_value: &'static str,
     /// CoinGecko's own id for this asset (not its ticker symbol).
     pub coingecko_id: &'static str,
+    /// The SAC (Stellar Asset Contract) address this asset is actually
+    /// custodied under - `vault::TargetWeight.asset` and
+    /// `router::{Token{A,B}}`'s own values, needed by fee-aware execution
+    /// (`chain::token_balance`, `chain::quote_swap`) to look up a live
+    /// balance or router quote for a `vault::compute_allocation` entry's
+    /// address without a separate on-chain lookup. Hardcoded alongside
+    /// `coingecko_id` for the same reason: this project's fixed asset
+    /// universe (see PROJECT.md's "Asset universe for v1" decision), not
+    /// deployment config like `VAULT_CONTRACT_ID` - it changes only if the
+    /// asset itself changes, not on every redeploy of `vault`/`router`
+    /// around it.
+    pub token_contract_id: &'static str,
 }
 
 pub const ASSETS: &[AssetConfig] = &[
@@ -32,14 +44,29 @@ pub const ASSETS: &[AssetConfig] = &[
         price_asset_kind: "other",
         price_asset_value: "XLM",
         coingecko_id: "stellar",
+        // Testnet's native XLM SAC - deterministic per network, not a
+        // deploy artifact (`stellar contract id asset --asset native
+        // --network testnet`).
+        token_contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
     },
     AssetConfig {
         symbol: "USDC",
         price_asset_kind: "other",
         price_asset_value: "USDC",
         coingecko_id: "usd-coin",
+        // Circle's testnet USDC issuer SAC - see PROJECT.md's deployment
+        // table.
+        token_contract_id: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
     },
 ];
+
+/// Looks up an `ASSETS` entry by its custodied token address - the
+/// direction `vault::compute_allocation`'s entries (keyed by that address)
+/// need to find a price symbol, since the contract itself only knows
+/// `price_asset`, not this backend's `coingecko_id`/symbol pairing.
+pub fn asset_by_token_contract_id(token_contract_id: &str) -> Option<&'static AssetConfig> {
+    ASSETS.iter().find(|a| a.token_contract_id == token_contract_id)
+}
 
 /// One poll of every configured asset against both sources. Never
 /// returns `Err` for a single source failing (a stale Reflector feed or a
