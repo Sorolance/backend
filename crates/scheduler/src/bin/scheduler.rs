@@ -6,7 +6,7 @@ use rebalancer_oracle::coingecko::CoinGeckoClient;
 use rebalancer_oracle::on_chain::OnChainPriceReader;
 use rebalancer_scheduler::chain::ChainClient;
 use rebalancer_scheduler::pricing::observe_market_prices;
-use rebalancer_scheduler::{config::Config, observe_risk_once, run_once, FeeAwareConfig};
+use rebalancer_scheduler::{config::Config, observe_risk_once, run_once, FeeAwareConfig, RebalanceParams};
 use tracing::{error, info};
 
 #[tokio::main]
@@ -71,45 +71,79 @@ async fn main() {
         portfolio_id = %portfolio.id,
         vault = %config.vault_contract_id,
         interval_secs = config.poll_interval_secs,
+        trigger_interval_secs = config.trigger_poll_interval_secs,
         "scheduler starting"
     );
 
     let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval_secs));
+    let mut trigger_interval =
+        tokio::time::interval(Duration::from_secs(config.trigger_poll_interval_secs));
     loop {
-        interval.tick().await;
-        if let Err(e) = observe_market_prices(
-            &pool,
-            &on_chain_prices,
-            &coingecko,
-            config.price_divergence_warn_bps,
-        )
-        .await
-        {
-            error!(error = %e, "price observation tick failed");
-        }
-        if let Err(e) = observe_risk_once(
-            &pool,
-            &chain,
-            &webhook_client,
-            portfolio.id,
-            &config.vault_contract_id,
-        )
-        .await
-        {
-            error!(error = %e, "risk observation tick failed");
-        }
-        if let Err(e) = run_once(
-            &pool,
-            &chain,
-            &on_chain_prices,
-            &webhook_client,
-            portfolio.id,
-            config.threshold_bps as u32,
-            &fee_aware,
-        )
-        .await
-        {
-            error!(error = %e, "tick failed");
+        tokio::select! {
+            _ = interval.tick() => {
+                if let Err(e) = observe_market_prices(
+                    &pool,
+                    &on_chain_prices,
+                    &coingecko,
+                    config.price_divergence_warn_bps,
+                )
+                .await
+                {
+                    error!(error = %e, "price observation tick failed");
+                }
+                if let Err(e) = observe_risk_once(
+                    &pool,
+                    &chain,
+                    &webhook_client,
+                    portfolio.id,
+                    &config.vault_contract_id,
+                )
+                .await
+                {
+                    error!(error = %e, "risk observation tick failed");
+                }
+                if let Err(e) = run_once(
+                    &pool,
+                    &chain,
+                    &on_chain_prices,
+                    &webhook_client,
+                    portfolio.id,
+                    RebalanceParams { threshold_bps: config.threshold_bps as u32, fee_aware, force_urgent: false },
+                )
+                .await
+                {
+                    error!(error = %e, "tick failed");
+                }
+            }
+            _ = trigger_interval.tick() => {
+                // Query-only unless something's actually pending - see
+                // trigger_poll_interval_secs's doc comment for why this
+                // runs on its own, much shorter interval than the full
+                // tick above.
+                match rebalancer_db::claim_pending_external_trigger(&pool, portfolio.id).await {
+                    Ok(Some(trigger)) => {
+                        info!(
+                            trigger_id = %trigger.id,
+                            reason = ?trigger.reason,
+                            "processing external trigger"
+                        );
+                        if let Err(e) = run_once(
+                            &pool,
+                            &chain,
+                            &on_chain_prices,
+                            &webhook_client,
+                            portfolio.id,
+                            RebalanceParams { threshold_bps: config.threshold_bps as u32, fee_aware, force_urgent: true },
+                        )
+                        .await
+                        {
+                            error!(error = %e, "triggered tick failed");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => error!(error = %e, "external trigger poll failed"),
+                }
+            }
         }
     }
 }

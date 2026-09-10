@@ -204,6 +204,166 @@ async fn report_csv_includes_header_and_recorded_events() {
         .unwrap();
 }
 
+fn sign(secret: &str, body: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+async fn register_portfolio(pool: &PgPool) -> (String, Uuid) {
+    let owner = format!("GTEST_{}", Uuid::new_v4().simple());
+    let vault_address = format!("CTEST{}", Uuid::new_v4().simple());
+    let response = build_router(pool.clone())
+        .oneshot(create_request(&owner, &vault_address))
+        .await
+        .unwrap();
+    let id = body_json(response).await["id"].as_str().unwrap().to_string();
+    (id.clone(), id.parse().unwrap())
+}
+
+#[tokio::test]
+async fn create_webhook_returns_a_usable_secret() {
+    let pool = test_pool().await;
+    let (id, portfolio_id) = register_portfolio(&pool).await;
+
+    let response = build_router(pool.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/portfolios/{id}/webhooks"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"url": "https://example.com/hook", "event_types": ["rebalance.completed"]})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = body_json(response).await;
+    assert_eq!(created["url"], "https://example.com/hook");
+    assert!(created["secret"].as_str().unwrap().len() >= 32);
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+async fn register_webhook(pool: &PgPool, portfolio_path_id: &str) -> String {
+    let response = build_router(pool.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/portfolios/{portfolio_path_id}/webhooks"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"url": "https://example.com/hook", "event_types": []}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    body_json(response).await["secret"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn trigger_with_a_correctly_signed_body_is_accepted_and_recorded() {
+    let pool = test_pool().await;
+    let (id, portfolio_id) = register_portfolio(&pool).await;
+    let secret = register_webhook(&pool, &id).await;
+
+    let body = serde_json::json!({"reason": "custom_price_shock"}).to_string();
+    let signature = sign(&secret, body.as_bytes());
+
+    let response = build_router(pool.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/portfolios/{id}/trigger"))
+                .header("content-type", "application/json")
+                .header("X-Rebalancer-Signature", format!("sha256={signature}"))
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let accepted = body_json(response).await;
+    assert!(accepted["id"].as_str().is_some());
+
+    let claimed = rebalancer_db::claim_pending_external_trigger(&pool, portfolio_id)
+        .await
+        .expect("claim")
+        .expect("a trigger was recorded");
+    assert_eq!(claimed.reason.as_deref(), Some("custom_price_shock"));
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn trigger_with_wrong_signature_is_rejected_with_401() {
+    let pool = test_pool().await;
+    let (id, portfolio_id) = register_portfolio(&pool).await;
+    register_webhook(&pool, &id).await;
+
+    let body = serde_json::json!({}).to_string();
+    let response = build_router(pool.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/portfolios/{id}/trigger"))
+                .header("content-type", "application/json")
+                .header("X-Rebalancer-Signature", format!("sha256={}", sign("wrong-secret", body.as_bytes())))
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn trigger_with_no_registered_webhook_is_rejected_with_400() {
+    let pool = test_pool().await;
+    let (id, portfolio_id) = register_portfolio(&pool).await;
+
+    let body = serde_json::json!({}).to_string();
+    let response = build_router(pool.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/portfolios/{id}/trigger"))
+                .header("content-type", "application/json")
+                .header("X-Rebalancer-Signature", format!("sha256={}", sign("anything", body.as_bytes())))
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn get_unknown_portfolio_returns_404() {
     let pool = test_pool().await;

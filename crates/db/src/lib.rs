@@ -313,5 +313,115 @@ pub async fn list_active_webhooks(
     .await
 }
 
+/// Registers a webhook subscriber for one portfolio. `secret` is generated
+/// by the caller (`crates/api`) and returned to the registering user
+/// exactly once, at registration time - this function just persists it,
+/// the same secret then doubles as the credential
+/// `insert_external_trigger`'s caller checks inbound requests against, so
+/// a power user manages one credential per portfolio, not two.
+pub async fn insert_webhook(
+    pool: &PgPool,
+    portfolio_id: Uuid,
+    url: &str,
+    secret: &str,
+    event_types: &[String],
+) -> Result<Webhook, sqlx::Error> {
+    sqlx::query_as(
+        "INSERT INTO webhooks (portfolio_id, url, secret, event_types)
+         VALUES ($1, $2, $3, $4)
+         RETURNING *",
+    )
+    .bind(portfolio_id)
+    .bind(url)
+    .bind(secret)
+    .bind(event_types)
+    .fetch_one(pool)
+    .await
+}
+
+/// Every active webhook for a portfolio, regardless of `event_types` -
+/// unlike `list_active_webhooks`, which filters to subscribers of one
+/// outbound event. Used to authenticate an inbound external-trigger
+/// request: any of a portfolio's registered secrets is a valid credential
+/// for that portfolio's `/trigger` endpoint, independent of which events
+/// that webhook happens to be subscribed to.
+pub async fn list_active_webhooks_for_portfolio(
+    pool: &PgPool,
+    portfolio_id: Uuid,
+) -> Result<Vec<Webhook>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM webhooks WHERE portfolio_id = $1 AND is_active = true")
+        .bind(portfolio_id)
+        .fetch_all(pool)
+        .await
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ExternalTrigger {
+    pub id: Uuid,
+    pub portfolio_id: Uuid,
+    pub reason: Option<String>,
+    pub payload: serde_json::Value,
+    pub requested_at: DateTime<Utc>,
+    pub processed_at: Option<DateTime<Utc>>,
+}
+
+/// Records an authenticated external trigger request (PROJECT.md
+/// differentiator #8) - `crates/api`'s `/trigger` handler calls this only
+/// after verifying the request's HMAC signature against one of the
+/// portfolio's registered webhook secrets. Unprocessed until
+/// `claim_pending_external_trigger` picks it up.
+pub async fn insert_external_trigger(
+    pool: &PgPool,
+    portfolio_id: Uuid,
+    reason: Option<&str>,
+    payload: serde_json::Value,
+) -> Result<ExternalTrigger, sqlx::Error> {
+    sqlx::query_as(
+        "INSERT INTO external_triggers (portfolio_id, reason, payload)
+         VALUES ($1, $2, $3)
+         RETURNING *",
+    )
+    .bind(portfolio_id)
+    .bind(reason)
+    .bind(payload)
+    .fetch_one(pool)
+    .await
+}
+
+/// Atomically claims the oldest unprocessed trigger for a portfolio, if
+/// any - `FOR UPDATE SKIP LOCKED` so a second scheduler instance polling
+/// the same portfolio (there's only ever one today, but this makes the
+/// query safe if that changes) can't double-claim the same row. Returns
+/// `None` when there's nothing pending, the common case on most polls.
+pub async fn claim_pending_external_trigger(
+    pool: &PgPool,
+    portfolio_id: Uuid,
+) -> Result<Option<ExternalTrigger>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let pending: Option<ExternalTrigger> = sqlx::query_as(
+        "SELECT * FROM external_triggers
+         WHERE portfolio_id = $1 AND processed_at IS NULL
+         ORDER BY requested_at
+         LIMIT 1
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(portfolio_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(trigger) = pending else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+
+    let claimed: ExternalTrigger =
+        sqlx::query_as("UPDATE external_triggers SET processed_at = now() WHERE id = $1 RETURNING *")
+            .bind(trigger.id)
+            .fetch_one(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    Ok(Some(claimed))
+}
+
 #[cfg(test)]
 mod test;

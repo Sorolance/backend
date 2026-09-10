@@ -17,7 +17,7 @@ See [`../PROJECT.md`](../PROJECT.md) for the full project plan.
 | `crates/notify` | `rebalancer-notify` | HMAC-SHA256-signed webhook dispatch (`X-Rebalancer-Signature`, the Stripe/GitHub model). |
 | `crates/scheduler` | `rebalancer-scheduler` | Polls the vault for drift, computes and fee-gates rebalances, submits them, and dispatches notifications. The main service — see [Fee-aware execution](#fee-aware-execution) below. |
 | `crates/backtest` | `rebalancer-backtest` | Replays a strategy (threshold, calendar, or volatility-band) against historical daily prices, reusing `rebalancer-core`'s live decision logic, with FIFO cost-basis tracking. Ships as a CLI (`backtest`) pending the `api` crate. |
-| `crates/api` | `rebalancer-api` | HTTP layer for the frontend, scoped to sub-portfolios + audit log export: registers a portfolio whose vault the frontend has already deployed/initialized/keeper-authorized (never touches the chain itself), lists a wallet's portfolios, and serves a CSV rebalance history export. The dashboard's live allocation/drift reads still go direct-to-contract — see [`../PROJECT.md`](../PROJECT.md). |
+| `crates/api` | `rebalancer-api` | HTTP layer for the frontend, covering sub-portfolios + audit log export and external trigger webhooks: registers a portfolio whose vault the frontend has already deployed/initialized/keeper-authorized (never touches the chain itself), lists a wallet's portfolios, serves a CSV rebalance history export, registers outbound webhooks, and accepts inbound trigger requests. The dashboard's live allocation/drift reads still go direct-to-contract — see [`../PROJECT.md`](../PROJECT.md). |
 
 ## Fee-aware execution
 
@@ -41,6 +41,35 @@ call — batching falls out of this for free, no separate logic needed.
 Tunable via `MAX_REBALANCE_COST_BPS`, `URGENT_DRIFT_MULTIPLIER`, and
 `EXECUTION_SLIPPAGE_BUFFER_BPS` (see [Configuration](#configuration)).
 
+## External trigger webhooks
+
+Power users can tell the scheduler to check a portfolio right now, instead
+of waiting on its own drift/calendar polling:
+
+1. `POST /portfolios/:id/webhooks` with `{"url": "...", "event_types": [...]}`
+   registers a webhook and returns its `secret` — shown exactly once, in
+   this response only. `event_types` governs outbound notification
+   subscriptions (`rebalance.completed`, `risk.circuit_breaker_tripped`);
+   the secret authenticates both directions, so it doubles as the
+   credential for step 2 regardless of which events were chosen.
+2. `POST /portfolios/:id/trigger` with an optional JSON body (e.g.
+   `{"reason": "price_shock"}`) and an
+   `X-Rebalancer-Signature: sha256=<hex hmac>` header — the same
+   HMAC-SHA256-over-the-raw-body scheme `rebalancer-notify` uses for
+   outbound events, just verified rather than produced. Any of the
+   portfolio's registered webhook secrets is a valid signing key. Returns
+   `202` and records a pending row in `external_triggers`.
+
+`rebalancer-scheduler` polls for a pending trigger on its own short
+interval (`TRIGGER_POLL_INTERVAL_SECS`, default 15s — much shorter than
+the main `POLL_INTERVAL_SECS`, since this check is DB-only with no chain
+calls) and, once claimed, runs an immediate check with `force_urgent`
+set: it overrides fee-aware execution's cost-deferral gate exactly as a
+genuinely urgent drift would, so the trigger doesn't sit waiting for
+cheaper network conditions. It never bypasses `needs_rebalance` itself or
+any on-chain check — `vault::rebalance` still reverts as a no-op if drift
+is genuinely below threshold, the same as it would on any other tick.
+
 ## Getting Started
 
 ### Prerequisites
@@ -60,7 +89,7 @@ Copy `.env.example` to `.env` and fill in the required values:
 | `VAULT_CONTRACT_ID`, `ORACLE_ADAPTER_CONTRACT_ID`, `ROUTER_CONTRACT_ID` | ✅ | Deployed contract addresses — see [`../contracts/README.md`](../contracts/README.md). |
 | `OWNER_ADDRESS` | ✅ | The vault owner's address (mirrored into `portfolios` for display; the contract remains the source of truth for authorization). |
 | `KEEPER_IDENTITY`, `KEEPER_ADDRESS` | ✅ | A `stellar keys` identity name (not a raw secret) authorized via `set_keeper`, and its address. |
-| `THRESHOLD_BPS`, `POLL_INTERVAL_SECS`, `PRICE_DIVERGENCE_WARN_BPS` | | Optional, sensible defaults — see `crates/scheduler/src/config.rs`. |
+| `THRESHOLD_BPS`, `POLL_INTERVAL_SECS`, `TRIGGER_POLL_INTERVAL_SECS`, `PRICE_DIVERGENCE_WARN_BPS` | | Optional, sensible defaults — see `crates/scheduler/src/config.rs`. |
 | `MAX_REBALANCE_COST_BPS`, `URGENT_DRIFT_MULTIPLIER`, `EXECUTION_SLIPPAGE_BUFFER_BPS` | | Fee-aware execution tuning — default to 50 bps, 2x, and 50 bps respectively. |
 
 ### Database
@@ -118,8 +147,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 - CoinGecko's public API rejects requests without a descriptive
   `User-Agent` outright, and rate-limits real usage — both handled and
   logged, not bugs if you see them.
-- No onboarding API/UI exists yet to register a webhook; insert a row
-  into `webhooks` by hand, or see
+- Webhooks are registered via `POST /portfolios/:id/webhooks` (see
+  [External trigger webhooks](#external-trigger-webhooks) above) — no
+  frontend UI for it yet, so use `curl`/Postman/etc. directly against
+  `rebalancer-api` for now.
+- To see an outbound notification actually delivered end-to-end, see
   `crates/scheduler/src/notifications/test.rs`'s `sends_a_real_signed_webhook`
   (an `#[ignore]`d test with the exact steps to run it against a local
   listener).
@@ -134,6 +166,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | 3 | Backtesting engine, calendar/volatility-band strategies, cost-basis tracking | Done — live-verified over real historical data |
 | 4 | Fee-aware execution | Done — live-verified (real deposit, real deferral, real execution, real drift drop confirmed on-chain) |
 | 4 | Sub-portfolios, audit log export | Backend done (`rebalancer-api`, integration-tested against real Postgres) — frontend integration not started |
+| 5 | External trigger webhooks | Done — `rebalancer-api` (register + inbound trigger, integration-tested) and `rebalancer-scheduler` (fast trigger poll + fee-aware override, unit-tested); not yet live-verified against a real deployed instance |
 
 See [`../PROJECT.md`](../PROJECT.md) for the full build log and every
 live-network verification behind these results.

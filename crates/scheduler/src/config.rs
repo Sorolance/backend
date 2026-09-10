@@ -34,6 +34,12 @@ pub struct Config {
     /// for it (it doesn't today).
     pub threshold_bps: i32,
     pub poll_interval_secs: u64,
+    /// How often to check for a pending external trigger (PROJECT.md
+    /// differentiator #8) - kept far shorter than `poll_interval_secs` by
+    /// default (query-only against `external_triggers`, no chain calls)
+    /// so a power user's POST to `/portfolios/:id/trigger` gets picked up
+    /// close to immediately rather than waiting for the next full tick.
+    pub trigger_poll_interval_secs: u64,
     /// The deployed `oracle_adapter` this vault reads from - needed here
     /// (separately from `vault_contract_id`) because `observe_market_prices`
     /// reads Reflector prices directly, for the CoinGecko cross-check.
@@ -102,6 +108,7 @@ impl Config {
             portfolio_name: optional("PORTFOLIO_NAME", "Demo Portfolio"),
             threshold_bps: parse_optional("THRESHOLD_BPS", 500)?,
             poll_interval_secs: parse_optional("POLL_INTERVAL_SECS", 300)?,
+            trigger_poll_interval_secs: parse_optional("TRIGGER_POLL_INTERVAL_SECS", 15)?,
             oracle_adapter_contract_id: require("ORACLE_ADAPTER_CONTRACT_ID")?,
             price_divergence_warn_bps: parse_optional("PRICE_DIVERGENCE_WARN_BPS", 300)?,
             router_contract_id: require("ROUTER_CONTRACT_ID")?,

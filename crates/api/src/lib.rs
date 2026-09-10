@@ -10,15 +10,17 @@
 //! portfolio's on-chain rebalance history as a CSV audit log.
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use rebalancer_db::{
-    get_portfolio, insert_portfolio_with_targets, list_portfolios_by_owner,
-    list_rebalance_events, list_targets, NewTarget, PgPool, Portfolio, Target, Uuid,
+    get_portfolio, insert_external_trigger, insert_portfolio_with_targets, insert_webhook,
+    list_active_webhooks_for_portfolio, list_portfolios_by_owner, list_rebalance_events,
+    list_targets, NewTarget, PgPool, Portfolio, Target, Uuid, Webhook,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
@@ -28,6 +30,8 @@ pub fn build_router(pool: PgPool) -> Router {
         .route("/portfolios", get(list_portfolios).post(create_portfolio))
         .route("/portfolios/:id", get(get_one_portfolio))
         .route("/portfolios/:id/report.csv", get(report_csv))
+        .route("/portfolios/:id/webhooks", post(create_webhook))
+        .route("/portfolios/:id/trigger", post(trigger_portfolio))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(pool)
 }
@@ -246,6 +250,133 @@ async fn report_csv(
         csv,
     )
         .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateWebhookRequest {
+    url: String,
+    /// e.g. `rebalance.completed`, `risk.circuit_breaker_tripped` - the
+    /// values `rebalancer-scheduler::notifications` dispatches on. Not
+    /// validated against a fixed list here (see `list_active_webhooks`'s
+    /// own doc comment: that list lives in `rebalancer-notify`/
+    /// `rebalancer-scheduler`, not a DB or API constraint).
+    #[serde(default)]
+    event_types: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebhookResponse {
+    id: Uuid,
+    url: String,
+    event_types: Vec<String>,
+    /// Only ever present in this one response - the create response is
+    /// the sole place a caller can read it back. It also authenticates
+    /// this portfolio's `/trigger` endpoint (see that handler below), so
+    /// losing it means registering a new webhook, not recovering the old
+    /// secret.
+    secret: String,
+}
+
+impl From<Webhook> for WebhookResponse {
+    fn from(w: Webhook) -> Self {
+        Self { id: w.id, url: w.url, event_types: w.event_types, secret: w.secret }
+    }
+}
+
+/// Registers an outbound webhook for a portfolio, generating its secret
+/// server-side (two concatenated UUIDv4s - 122 bits of randomness each,
+/// far more than an HMAC-SHA256 key needs - rather than pulling in a
+/// dedicated `rand` dependency for this one call site). The same secret
+/// then authenticates inbound requests to `/trigger` below - see
+/// `insert_webhook`'s doc comment in `rebalancer-db`.
+async fn create_webhook(
+    State(pool): State<PgPool>,
+    Path(portfolio_id): Path<Uuid>,
+    Json(req): Json<CreateWebhookRequest>,
+) -> Result<(StatusCode, Json<WebhookResponse>), ApiError> {
+    get_portfolio(&pool, portfolio_id).await?.ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "portfolio not found".into(),
+    })?;
+    if req.url.is_empty() {
+        return Err(ApiError { status: StatusCode::BAD_REQUEST, message: "url must not be empty".into() });
+    }
+
+    let secret = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let webhook = insert_webhook(&pool, portfolio_id, &req.url, &secret, &req.event_types).await?;
+    Ok((StatusCode::CREATED, Json(webhook.into())))
+}
+
+#[derive(Debug, Serialize)]
+struct TriggerResponse {
+    id: Uuid,
+    requested_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// External trigger webhooks (PROJECT.md differentiator #8): lets a power
+/// user's own system tell this backend "check this portfolio now"
+/// instead of waiting on the scheduler's own drift/calendar polling.
+/// Authenticated the same way outbound webhooks are, just in reverse -
+/// the caller signs the raw request body with `X-Rebalancer-Signature:
+/// sha256=<hmac>` using any secret from one of this portfolio's
+/// registered webhooks (`rebalancer_notify::verify_signature`, the
+/// receiving side of the exact scheme `WebhookClient::send` produces).
+/// A body is optional; when present it must be a JSON object, and its
+/// optional `reason` string field is pulled out for the trigger row's
+/// own `reason` column while the whole object is kept as `payload`.
+///
+/// This never bypasses `vault`'s on-chain drift gate - it can't, that's
+/// enforced in the contract. `rebalancer-scheduler::run_once` only uses a
+/// claimed trigger to skip its own fee-aware cost deferral, so the
+/// backend still won't submit a rebalance the chain would reject anyway.
+async fn trigger_portfolio(
+    State(pool): State<PgPool>,
+    Path(portfolio_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<TriggerResponse>), ApiError> {
+    get_portfolio(&pool, portfolio_id).await?.ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "portfolio not found".into(),
+    })?;
+
+    let webhooks = list_active_webhooks_for_portfolio(&pool, portfolio_id).await?;
+    if webhooks.is_empty() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "no webhook registered for this portfolio yet - register one via POST /portfolios/:id/webhooks first".into(),
+        });
+    }
+
+    let signature = headers
+        .get("X-Rebalancer-Signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError { status: StatusCode::UNAUTHORIZED, message: "missing X-Rebalancer-Signature header".into() })?;
+    let authenticated = webhooks
+        .iter()
+        .any(|w| rebalancer_notify::verify_signature(&w.secret, &body, signature));
+    if !authenticated {
+        return Err(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "signature did not match any registered webhook secret for this portfolio".into(),
+        });
+    }
+
+    let payload: serde_json::Value = if body.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_slice(&body).map_err(|_| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "body must be a JSON object".into(),
+        })?
+    };
+    let reason = payload.get("reason").and_then(|v| v.as_str()).map(str::to_owned);
+
+    let trigger = insert_external_trigger(&pool, portfolio_id, reason.as_deref(), payload).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(TriggerResponse { id: trigger.id, requested_at: trigger.requested_at }),
+    ))
 }
 
 #[cfg(test)]

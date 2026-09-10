@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 rebalancer-db = { path = "../db" }
+rebalancer-notify = { path = "../notify" }
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -16,6 +17,10 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres"] }
 # feature needs enabling somewhere for Uuid path params/response fields to
 # (de)serialize, same reasoning as rebalancer-scheduler's own Cargo.toml.
 uuid = { version = "1", features = ["serde"] }
+# TriggerResponse.requested_at is a DateTime<Utc> passed straight through
+# from rebalancer-db's ExternalTrigger - promoted out of dev-dependencies
+# now that a non-test response type needs it too.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -26,4 +31,9 @@ path = "src/bin/api.rs"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Only for the test module's own `sign` helper, which computes a
+# reference signature independently of `rebalancer_notify::verify_signature`
+# (the code under test) so a bug shared between them can't hide.
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"

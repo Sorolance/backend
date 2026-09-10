@@ -47,6 +47,22 @@ pub struct FeeAwareConfig {
     pub execution_slippage_buffer_bps: u32,
 }
 
+/// Per-call parameters for `run_once`, grouped into one struct purely to
+/// keep its argument count sane (clippy's `too_many_arguments`) - `pool`,
+/// `chain`, `on_chain_prices`, and `webhook_client` stay as their own
+/// params since the body borrows each of them independently and often
+/// more than once (`chain.clone()` inside every `spawn_blocking` call in
+/// particular), where bundling would just move the noise rather than cut
+/// it.
+#[derive(Debug, Clone, Copy)]
+pub struct RebalanceParams {
+    pub threshold_bps: u32,
+    pub fee_aware: FeeAwareConfig,
+    /// See `run_once`'s own doc comment for what this does and doesn't
+    /// override.
+    pub force_urgent: bool,
+}
+
 /// One poll-and-maybe-rebalance cycle for a single portfolio. Blocking
 /// (the `stellar` CLI calls inside `chain` are synchronous subprocess
 /// calls) - callers on an async runtime should run this via
@@ -70,15 +86,26 @@ pub struct FeeAwareConfig {
 /// one transaction, one network fee - that's the "batch small rebalances"
 /// half of the same PROJECT.md item, and falls out of this for free since
 /// `compute_rebalance_trades` already returns the whole batch at once.
+///
+/// `force_urgent` is set when this call is servicing a claimed external
+/// trigger (PROJECT.md differentiator #8, `rebalancer-api`'s
+/// `/portfolios/:id/trigger`) rather than a plain interval tick - it
+/// overrides the fee-aware cost gate exactly as a genuinely urgent drift
+/// would, so a power user's own trigger condition doesn't sit deferred
+/// behind `fee_aware.max_cost_bps` waiting for cheaper network
+/// conditions. It does *not* touch the `needs_rebalance` check above -
+/// that mirrors an invariant enforced in the `vault` contract itself
+/// (`rebalance` reverts as a no-op below threshold), which no amount of
+/// backend-side urgency can or should bypass.
 pub async fn run_once(
     pool: &PgPool,
     chain: &ChainClient,
     on_chain_prices: &OnChainPriceReader,
     webhook_client: &WebhookClient,
     portfolio_id: Uuid,
-    threshold_bps: u32,
-    fee_aware: &FeeAwareConfig,
+    params: RebalanceParams,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let RebalanceParams { threshold_bps, fee_aware, force_urgent } = params;
     let c = chain.clone();
     let needs = tokio::task::spawn_blocking(move || c.needs_rebalance()).await??;
     if !needs {
@@ -188,13 +215,17 @@ pub async fn run_once(
     let network_fee_value = fee_stats.soroban_inclusion_fee.p99.saturating_mul(xlm_price);
 
     let total_cost_bps = rebalancer_core::total_cost_bps(trade_value, network_fee_value, worst_slippage_bps);
-    let decision = rebalancer_core::evaluate_fee_aware_execution(
-        max_drift_bps,
-        threshold_bps,
-        fee_aware.urgent_drift_multiplier,
-        total_cost_bps,
-        fee_aware.max_cost_bps,
-    );
+    let decision = if force_urgent {
+        rebalancer_core::FeeAwareDecision { execute: true, urgent: true, total_cost_bps }
+    } else {
+        rebalancer_core::evaluate_fee_aware_execution(
+            max_drift_bps,
+            threshold_bps,
+            fee_aware.urgent_drift_multiplier,
+            total_cost_bps,
+            fee_aware.max_cost_bps,
+        )
+    };
 
     if !decision.execute {
         info!(

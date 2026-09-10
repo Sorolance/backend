@@ -83,5 +83,26 @@ fn sign(secret: &str, body: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// The receiving side of the same scheme `send` produces - verifies an
+/// inbound `X-Rebalancer-Signature: sha256=<hex>` header against `body`,
+/// recomputing HMAC-SHA256 with `secret`. Used by `rebalancer-api`'s
+/// external-trigger endpoint (PROJECT.md differentiator #8) to
+/// authenticate inbound requests without duplicating the HMAC logic in a
+/// second crate. Comparison is constant-time (`Mac::verify_slice`), not a
+/// `==` on hex strings, so a timing side channel can't leak the correct
+/// signature one byte at a time.
+pub fn verify_signature(secret: &str, body: &[u8], header_value: &str) -> bool {
+    let Some(hex_sig) = header_value.strip_prefix("sha256=") else {
+        return false;
+    };
+    let Ok(expected) = hex::decode(hex_sig) else {
+        return false;
+    };
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(body);
+    mac.verify_slice(&expected).is_ok()
+}
+
 #[cfg(test)]
 mod test;

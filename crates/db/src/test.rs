@@ -379,6 +379,93 @@ async fn list_portfolios_by_owner_and_list_rebalance_events() {
 }
 
 #[tokio::test]
+async fn insert_webhook_then_list_active_webhooks_for_portfolio_finds_it() {
+    let pool = test_pool().await;
+    let vault_address = format!("CTEST{}", Uuid::new_v4().simple());
+    let portfolio = upsert_portfolio(&pool, &vault_address, "GOWNER", "trigger test", 500)
+        .await
+        .expect("upsert portfolio");
+
+    let webhook = insert_webhook(
+        &pool,
+        portfolio.id,
+        "https://example.com/hook",
+        "shh-its-a-secret",
+        &["rebalance.completed".to_string()],
+    )
+    .await
+    .expect("insert webhook");
+    assert_eq!(webhook.secret, "shh-its-a-secret");
+
+    let active = list_active_webhooks_for_portfolio(&pool, portfolio.id)
+        .await
+        .expect("list active webhooks");
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, webhook.id);
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn claim_pending_external_trigger_claims_oldest_unprocessed_then_stops() {
+    let pool = test_pool().await;
+    let vault_address = format!("CTEST{}", Uuid::new_v4().simple());
+    let portfolio = upsert_portfolio(&pool, &vault_address, "GOWNER", "trigger test", 500)
+        .await
+        .expect("upsert portfolio");
+
+    // Nothing pending yet.
+    assert!(claim_pending_external_trigger(&pool, portfolio.id)
+        .await
+        .expect("claim with nothing pending")
+        .is_none());
+
+    let first = insert_external_trigger(
+        &pool,
+        portfolio.id,
+        Some("price_shock"),
+        serde_json::json!({"reason": "price_shock"}),
+    )
+    .await
+    .expect("insert first trigger");
+    let _second = insert_external_trigger(&pool, portfolio.id, None, serde_json::json!({}))
+        .await
+        .expect("insert second trigger");
+
+    // Claims the oldest one first, marks it processed.
+    let claimed = claim_pending_external_trigger(&pool, portfolio.id)
+        .await
+        .expect("claim first trigger")
+        .expect("a trigger was pending");
+    assert_eq!(claimed.id, first.id);
+    assert_eq!(claimed.reason.as_deref(), Some("price_shock"));
+    assert!(claimed.processed_at.is_some());
+
+    // A second call gets the other one, not the same row again.
+    let claimed_again = claim_pending_external_trigger(&pool, portfolio.id)
+        .await
+        .expect("claim second trigger")
+        .expect("a second trigger was pending");
+    assert_ne!(claimed_again.id, first.id);
+
+    // Both now processed - nothing left to claim.
+    assert!(claim_pending_external_trigger(&pool, portfolio.id)
+        .await
+        .expect("claim with nothing left pending")
+        .is_none());
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn list_active_webhooks_filters_by_event_type_and_active_flag() {
     let pool = test_pool().await;
     let vault_address = format!("CTEST{}", Uuid::new_v4().simple());
