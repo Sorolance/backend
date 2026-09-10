@@ -7,7 +7,13 @@
 //! deploys a contract or holds a key that could - see the `contracts`
 //! repo's `vault::initialize`, which requires `owner.require_auth()`),
 //! listing a wallet's portfolios for the dashboard, and exporting one
-//! portfolio's on-chain rebalance history as a CSV audit log.
+//! portfolio's on-chain rebalance history as a CSV audit log. Also covers
+//! external trigger webhooks and the what-if simulator, neither of which
+//! needs chain access either - `/simulate` takes the caller's own live
+//! balances/prices as input (the frontend already has them, reading the
+//! contract directly for the dashboard - see `PROJECT.md` section 6)
+//! rather than this crate fetching them itself, preserving the
+//! never-touches-the-chain boundary above.
 
 use axum::{
     body::Bytes,
@@ -23,6 +29,7 @@ use rebalancer_db::{
     list_targets, NewTarget, PgPool, Portfolio, Target, Uuid, Webhook,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tower_http::cors::{Any, CorsLayer};
 
 pub fn build_router(pool: PgPool) -> Router {
@@ -32,6 +39,7 @@ pub fn build_router(pool: PgPool) -> Router {
         .route("/portfolios/:id/report.csv", get(report_csv))
         .route("/portfolios/:id/webhooks", post(create_webhook))
         .route("/portfolios/:id/trigger", post(trigger_portfolio))
+        .route("/portfolios/:id/simulate", post(simulate_portfolio))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(pool)
 }
@@ -377,6 +385,151 @@ async fn trigger_portfolio(
         StatusCode::ACCEPTED,
         Json(TriggerResponse { id: trigger.id, requested_at: trigger.requested_at }),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct SimulateRequest {
+    /// Live balance for each target asset, keyed by `targets.asset` (the
+    /// vault-held token's contract id - the same identifier
+    /// `GET /portfolios/:id`'s `targets[].asset` already returns), as an
+    /// `i128` string - JSON numbers can't carry that range safely,
+    /// matching how `rebalance_events.trades` already serializes amounts
+    /// elsewhere in this crate.
+    balances: HashMap<String, String>,
+    /// Live oracle price for each target asset, same keying and
+    /// stringified-`i128` convention as `balances`, in whatever
+    /// consistent fixed-point base the caller used to fetch both -
+    /// `rebalancer_core::compute_allocation` only ever compares
+    /// `balance * price` ratios, so the base itself doesn't matter here
+    /// as long as it's the same one across every asset in one request.
+    prices: HashMap<String, String>,
+    /// Per-asset price shock, in bps of that asset's `prices` entry -
+    /// negative for a drop (e.g. -3000 for "this asset's price falls
+    /// 30%"), positive for a spike. Assets not present here are left at
+    /// their live price. Balances are never shocked - a price move
+    /// doesn't change what's actually held.
+    #[serde(default)]
+    shocks: HashMap<String, i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct SimulatedAllocationEntry {
+    asset: String,
+    target_weight_bps: u32,
+    current_weight_bps: u32,
+    drift_bps: i32,
+}
+
+impl From<rebalancer_core::AllocationEntry<String>> for SimulatedAllocationEntry {
+    fn from(e: rebalancer_core::AllocationEntry<String>) -> Self {
+        Self {
+            asset: e.asset,
+            target_weight_bps: e.target_weight_bps,
+            current_weight_bps: e.current_weight_bps,
+            drift_bps: e.drift_bps,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SimulatedTrade {
+    asset_in: String,
+    asset_out: String,
+    amount_in: String,
+}
+
+impl From<rebalancer_core::TradeIntent<String>> for SimulatedTrade {
+    fn from(t: rebalancer_core::TradeIntent<String>) -> Self {
+        Self { asset_in: t.asset_in, asset_out: t.asset_out, amount_in: t.amount_in.to_string() }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SimulateResponse {
+    needs_rebalance: bool,
+    allocation: Vec<SimulatedAllocationEntry>,
+    /// The trades `rebalancer_core::compute_rebalance_trades` says would
+    /// bring the portfolio back to target under the shocked prices -
+    /// always empty when `needs_rebalance` is false. Nothing here ever
+    /// gets submitted; this crate has no keeper key to submit it with in
+    /// the first place (see this module's own doc comment).
+    trades: Vec<SimulatedTrade>,
+}
+
+/// Shocks `price` by `shock_bps` (bps of `price`, signed) - floors at 0
+/// rather than going negative, since a shock past -10000 bps ("more than
+/// -100%") has no real-world meaning for a price.
+fn apply_shock(price: i128, shock_bps: i32) -> i128 {
+    let factor = 10_000i128 + shock_bps as i128;
+    if factor <= 0 {
+        return 0;
+    }
+    price.saturating_mul(factor) / 10_000
+}
+
+/// What-if stress simulator (PROJECT.md differentiator #9): "BTC drops
+/// 30% tomorrow" - given the portfolio's real current balances/prices
+/// (supplied by the caller, not fetched here - see this module's doc
+/// comment) plus a per-asset price shock, projects the resulting drift
+/// and the trades that would fire, without executing anything. Reuses
+/// `rebalancer_core::{compute_allocation, needs_rebalance,
+/// compute_rebalance_trades}` unchanged - the same functions
+/// `rebalancer-scheduler` runs against real on-chain data every tick -
+/// so a projection here reflects the live decision logic exactly, the
+/// same fidelity guarantee `rebalancer-backtest` makes for historical
+/// replay.
+async fn simulate_portfolio(
+    State(pool): State<PgPool>,
+    Path(portfolio_id): Path<Uuid>,
+    Json(req): Json<SimulateRequest>,
+) -> Result<Json<SimulateResponse>, ApiError> {
+    let portfolio = get_portfolio(&pool, portfolio_id).await?.ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "portfolio not found".into(),
+    })?;
+    let targets = list_targets(&pool, portfolio_id).await?;
+
+    let mut target_weights = Vec::with_capacity(targets.len());
+    let mut states = Vec::with_capacity(targets.len());
+    for t in &targets {
+        let balance_str = req.balances.get(&t.asset).ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("missing balances[\"{}\"]", t.asset),
+        })?;
+        let balance: i128 = balance_str.parse().map_err(|_| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("balances[\"{}\"] is not a valid integer", t.asset),
+        })?;
+        let price_str = req.prices.get(&t.asset).ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("missing prices[\"{}\"]", t.asset),
+        })?;
+        let price: i128 = price_str.parse().map_err(|_| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("prices[\"{}\"] is not a valid integer", t.asset),
+        })?;
+        let shocked_price = apply_shock(price, req.shocks.get(&t.asset).copied().unwrap_or(0));
+
+        target_weights.push(rebalancer_core::TargetWeight {
+            asset: t.asset.clone(),
+            weight_bps: t.weight_bps as u32,
+        });
+        states.push(rebalancer_core::AssetState { asset: t.asset.clone(), balance, price: shocked_price });
+    }
+
+    let allocation = rebalancer_core::compute_allocation(&target_weights, &states);
+    let needs = rebalancer_core::needs_rebalance(&allocation, portfolio.threshold_bps as u32);
+    let trades = if needs {
+        rebalancer_core::compute_rebalance_trades(&target_weights, &states)
+    } else {
+        Vec::new()
+    };
+
+    Ok(Json(SimulateResponse {
+        needs_rebalance: needs,
+        allocation: allocation.into_iter().map(Into::into).collect(),
+        trades: trades.into_iter().map(Into::into).collect(),
+    }))
 }
 
 #[cfg(test)]

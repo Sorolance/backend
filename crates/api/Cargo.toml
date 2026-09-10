@@ -5,6 +5,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+rebalancer-core = { path = "../core" }
 rebalancer-db = { path = "../db" }
 rebalancer-notify = { path = "../notify" }
 axum = "0.7"

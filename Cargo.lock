@@ -1270,6 +1270,7 @@ dependencies = [
  "hex",
  "hmac",
  "http-body-util",
+ "rebalancer-core",
  "rebalancer-db",
  "rebalancer-notify",
  "serde",

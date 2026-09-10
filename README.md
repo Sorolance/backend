@@ -17,7 +17,7 @@ See [`../PROJECT.md`](../PROJECT.md) for the full project plan.
 | `crates/notify` | `rebalancer-notify` | HMAC-SHA256-signed webhook dispatch (`X-Rebalancer-Signature`, the Stripe/GitHub model). |
 | `crates/scheduler` | `rebalancer-scheduler` | Polls the vault for drift, computes and fee-gates rebalances, submits them, and dispatches notifications. The main service — see [Fee-aware execution](#fee-aware-execution) below. |
 | `crates/backtest` | `rebalancer-backtest` | Replays a strategy (threshold, calendar, or volatility-band) against historical daily prices, reusing `rebalancer-core`'s live decision logic, with FIFO cost-basis tracking. Ships as a CLI (`backtest`) pending the `api` crate. |
-| `crates/api` | `rebalancer-api` | HTTP layer for the frontend, covering sub-portfolios + audit log export and external trigger webhooks: registers a portfolio whose vault the frontend has already deployed/initialized/keeper-authorized (never touches the chain itself), lists a wallet's portfolios, serves a CSV rebalance history export, registers outbound webhooks, and accepts inbound trigger requests. The dashboard's live allocation/drift reads still go direct-to-contract — see [`../PROJECT.md`](../PROJECT.md). |
+| `crates/api` | `rebalancer-api` | HTTP layer for the frontend, covering sub-portfolios + audit log export, external trigger webhooks, and the what-if simulator: registers a portfolio whose vault the frontend has already deployed/initialized/keeper-authorized (never touches the chain itself), lists a wallet's portfolios, serves a CSV rebalance history export, registers outbound webhooks, accepts inbound trigger requests, and projects a price-shock's drift/trades from caller-supplied live balances/prices. The dashboard's live allocation/drift reads still go direct-to-contract — see [`../PROJECT.md`](../PROJECT.md). |
 
 ## Fee-aware execution
 
@@ -69,6 +69,34 @@ genuinely urgent drift would, so the trigger doesn't sit waiting for
 cheaper network conditions. It never bypasses `needs_rebalance` itself or
 any on-chain check — `vault::rebalance` still reverts as a no-op if drift
 is genuinely below threshold, the same as it would on any other tick.
+
+## What-if simulator
+
+`POST /portfolios/:id/simulate` projects "what if this asset's price
+moved X%" without executing anything — no keeper key, no chain call, this
+crate genuinely can't submit a trade even if it wanted to. The caller
+supplies the portfolio's *real* current balances and prices (the
+frontend already has both, reading the contract directly for the
+dashboard — see [`../PROJECT.md`](../PROJECT.md) section 6) plus an
+optional per-asset shock in bps:
+
+```sh
+curl -X POST http://localhost:8080/portfolios/<id>/simulate \
+  -H 'content-type: application/json' \
+  -d '{
+    "balances": {"<asset>": "6000000000000", "<asset2>": "4000000000000"},
+    "prices":   {"<asset>": "1000000",       "<asset2>": "1000000"},
+    "shocks":   {"<asset>": -3000}
+  }'
+```
+
+`<asset>` is each target's token contract id, matching
+`GET /portfolios/:id`'s `targets[].asset`; `-3000` bps means "this
+asset's price drops 30%". The response is projected per-asset
+weight/drift, whether a rebalance would trigger, and (if so) the trades
+that would fire — computed by `rebalancer_core::{compute_allocation,
+needs_rebalance, compute_rebalance_trades}` unchanged, the same functions
+the scheduler runs against real on-chain data every tick.
 
 ## Getting Started
 
@@ -167,6 +195,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | 4 | Fee-aware execution | Done — live-verified (real deposit, real deferral, real execution, real drift drop confirmed on-chain) |
 | 4 | Sub-portfolios, audit log export | Backend done (`rebalancer-api`, integration-tested against real Postgres) — frontend integration not started |
 | 5 | External trigger webhooks | Done — `rebalancer-api` (register + inbound trigger, integration-tested) and `rebalancer-scheduler` (fast trigger poll + fee-aware override, unit-tested); not yet live-verified against a real deployed instance |
+| 5 | What-if simulator | Done — `rebalancer-api`'s `/simulate`, integration-tested and live-verified against a running instance (on-target no-op, a shocked-drift case projecting the correct trade, and a missing-input 400) |
 
 See [`../PROJECT.md`](../PROJECT.md) for the full build log and every
 live-network verification behind these results.

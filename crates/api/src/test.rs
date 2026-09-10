@@ -364,6 +364,121 @@ async fn trigger_with_no_registered_webhook_is_rejected_with_400() {
         .unwrap();
 }
 
+/// The `create_request` fixture's targets: 60% `CASSET_XLM` / 40%
+/// `CASSET_USDC`, threshold 500 bps - kept here rather than duplicated in
+/// each test below.
+fn on_target_simulate_body(shocks: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "balances": {"CASSET_XLM": "6000000000000", "CASSET_USDC": "4000000000000"},
+        "prices": {"CASSET_XLM": "1000000", "CASSET_USDC": "1000000"},
+        "shocks": shocks,
+    })
+}
+
+#[tokio::test]
+async fn simulate_on_target_with_no_shock_needs_no_rebalance() {
+    let pool = test_pool().await;
+    let (id, portfolio_id) = register_portfolio(&pool).await;
+
+    let response = build_router(pool.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/portfolios/{id}/simulate"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(on_target_simulate_body(serde_json::json!({})).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = body_json(response).await;
+    assert_eq!(result["needs_rebalance"], false);
+    assert_eq!(result["trades"].as_array().unwrap().len(), 0);
+    assert_eq!(result["allocation"].as_array().unwrap().len(), 2);
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn simulate_with_a_large_price_shock_projects_a_rebalance_and_trades() {
+    let pool = test_pool().await;
+    let (id, portfolio_id) = register_portfolio(&pool).await;
+
+    // XLM's price drops 30% - its value share falls well past the 500bps
+    // threshold, so USDC becomes overweight and a trade should be
+    // projected from USDC into XLM to bring the split back to 60/40.
+    let response = build_router(pool.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/portfolios/{id}/simulate"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    on_target_simulate_body(serde_json::json!({"CASSET_XLM": -3000})).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = body_json(response).await;
+    assert_eq!(result["needs_rebalance"], true);
+    let trades = result["trades"].as_array().unwrap();
+    assert_eq!(trades.len(), 1);
+    assert_eq!(trades[0]["asset_in"], "CASSET_USDC");
+    assert_eq!(trades[0]["asset_out"], "CASSET_XLM");
+
+    let xlm_entry = result["allocation"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["asset"] == "CASSET_XLM")
+        .unwrap();
+    assert!(xlm_entry["drift_bps"].as_i64().unwrap() < 0, "shocked XLM should be underweight");
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn simulate_missing_an_assets_balance_is_rejected_with_400() {
+    let pool = test_pool().await;
+    let (id, portfolio_id) = register_portfolio(&pool).await;
+
+    let response = build_router(pool.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/portfolios/{id}/simulate"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "balances": {"CASSET_XLM": "6000000000000"},
+                        "prices": {"CASSET_XLM": "1000000", "CASSET_USDC": "1000000"},
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn get_unknown_portfolio_returns_404() {
     let pool = test_pool().await;
