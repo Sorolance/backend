@@ -269,6 +269,116 @@ async fn insert_price_snapshot_allows_multiple_rows_per_asset() {
 }
 
 #[tokio::test]
+async fn insert_portfolio_with_targets_writes_both_in_one_call() {
+    let pool = test_pool().await;
+    let vault_address = format!("CTEST{}", Uuid::new_v4().simple());
+
+    let portfolio = insert_portfolio_with_targets(
+        &pool,
+        &vault_address,
+        "GOWNER",
+        "sub-portfolio test",
+        500,
+        &[
+            NewTarget {
+                asset: "CASSET_XLM".into(),
+                price_asset_kind: "other".into(),
+                price_asset_value: "XLM".into(),
+                weight_bps: 6_000,
+            },
+            NewTarget {
+                asset: "CASSET_USDC".into(),
+                price_asset_kind: "other".into(),
+                price_asset_value: "USDC".into(),
+                weight_bps: 4_000,
+            },
+        ],
+    )
+    .await
+    .expect("insert portfolio with targets");
+
+    let targets = list_targets(&pool, portfolio.id)
+        .await
+        .expect("list targets");
+    assert_eq!(targets.len(), 2);
+    assert!(targets.iter().any(|t| t.asset == "CASSET_XLM" && t.weight_bps == 6_000));
+    assert!(targets.iter().any(|t| t.asset == "CASSET_USDC" && t.weight_bps == 4_000));
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn insert_portfolio_with_targets_rejects_duplicate_vault_address() {
+    let pool = test_pool().await;
+    let vault_address = format!("CTEST{}", Uuid::new_v4().simple());
+    let targets = [NewTarget {
+        asset: "CASSET_XLM".into(),
+        price_asset_kind: "other".into(),
+        price_asset_value: "XLM".into(),
+        weight_bps: 10_000,
+    }];
+
+    let first = insert_portfolio_with_targets(&pool, &vault_address, "GOWNER", "first", 500, &targets)
+        .await
+        .expect("first registration succeeds");
+
+    let err = insert_portfolio_with_targets(&pool, &vault_address, "GOWNER", "second", 500, &targets)
+        .await
+        .expect_err("re-registering the same vault_address must fail");
+    assert!(matches!(err, sqlx::Error::Database(_)));
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(first.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn list_portfolios_by_owner_and_list_rebalance_events() {
+    let pool = test_pool().await;
+    let owner = format!("GTEST_{}", Uuid::new_v4().simple());
+    let vault_address = format!("CTEST{}", Uuid::new_v4().simple());
+
+    let portfolio = upsert_portfolio(&pool, &vault_address, &owner, "list test", 500)
+        .await
+        .expect("upsert portfolio");
+
+    let mine = list_portfolios_by_owner(&pool, &owner)
+        .await
+        .expect("list portfolios by owner");
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].id, portfolio.id);
+
+    assert!(get_portfolio(&pool, portfolio.id)
+        .await
+        .expect("get portfolio")
+        .is_some());
+
+    let tx_hash = format!("{}", Uuid::new_v4().simple());
+    insert_rebalance_event(&pool, portfolio.id, &tx_hash, Utc::now(), serde_json::json!([]))
+        .await
+        .expect("insert rebalance event")
+        .expect("new row inserted");
+
+    let events = list_rebalance_events(&pool, portfolio.id)
+        .await
+        .expect("list rebalance events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].tx_hash, tx_hash);
+
+    sqlx::query("DELETE FROM portfolios WHERE id = $1")
+        .bind(portfolio.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn list_active_webhooks_filters_by_event_type_and_active_flag() {
     let pool = test_pool().await;
     let vault_address = format!("CTEST{}", Uuid::new_v4().simple());

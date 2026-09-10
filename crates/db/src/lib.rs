@@ -91,6 +91,117 @@ pub struct Webhook {
     pub created_at: DateTime<Utc>,
 }
 
+/// One target weight to write alongside a new portfolio - mirrors
+/// `contracts::vault::TargetWeight` plus the DB's separate
+/// `price_asset_kind`/`price_asset_value` split (see `targets`'s migration
+/// doc comment).
+#[derive(Debug, Clone)]
+pub struct NewTarget {
+    pub asset: String,
+    pub price_asset_kind: String,
+    pub price_asset_value: String,
+    pub weight_bps: i32,
+}
+
+/// Registers a brand-new sub-portfolio: the vault has already been
+/// deployed, `initialize`d, and had `set_keeper` called on it by the
+/// owner's own wallet (see `crates/api`'s `POST /portfolios`) - this just
+/// records that fact so the scheduler and dashboard pick it up. Unlike
+/// `upsert_portfolio` (used by the scheduler's single-instance startup
+/// seeding), this is a one-shot insert: a second call with the same
+/// `vault_address` fails on the `UNIQUE` constraint rather than silently
+/// updating, since re-registering an existing portfolio is never a valid
+/// client action.
+pub async fn insert_portfolio_with_targets(
+    pool: &PgPool,
+    vault_address: &str,
+    owner_address: &str,
+    name: &str,
+    threshold_bps: i32,
+    targets: &[NewTarget],
+) -> Result<Portfolio, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let portfolio: Portfolio = sqlx::query_as(
+        "INSERT INTO portfolios (vault_address, owner_address, name, threshold_bps)
+         VALUES ($1, $2, $3, $4)
+         RETURNING *",
+    )
+    .bind(vault_address)
+    .bind(owner_address)
+    .bind(name)
+    .bind(threshold_bps)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    for t in targets {
+        sqlx::query(
+            "INSERT INTO targets (portfolio_id, asset, price_asset_kind, price_asset_value, weight_bps)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(portfolio.id)
+        .bind(&t.asset)
+        .bind(&t.price_asset_kind)
+        .bind(&t.price_asset_value)
+        .bind(t.weight_bps)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(portfolio)
+}
+
+/// Every registered portfolio, across all owners - the scheduler's own
+/// polling loop uses this to tick every sub-portfolio's vault on the same
+/// interval, rather than the single env-configured one it was limited to
+/// before sub-portfolios existed.
+pub async fn list_portfolios(pool: &PgPool) -> Result<Vec<Portfolio>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM portfolios ORDER BY created_at")
+        .fetch_all(pool)
+        .await
+}
+
+/// Every portfolio owned by one wallet address - what the dashboard's
+/// portfolio list queries by.
+pub async fn list_portfolios_by_owner(
+    pool: &PgPool,
+    owner_address: &str,
+) -> Result<Vec<Portfolio>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM portfolios WHERE owner_address = $1 ORDER BY created_at")
+        .bind(owner_address)
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn get_portfolio(pool: &PgPool, id: Uuid) -> Result<Option<Portfolio>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM portfolios WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn list_targets(pool: &PgPool, portfolio_id: Uuid) -> Result<Vec<Target>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM targets WHERE portfolio_id = $1 ORDER BY created_at")
+        .bind(portfolio_id)
+        .fetch_all(pool)
+        .await
+}
+
+/// Every recorded rebalance for one portfolio, newest first - the source
+/// rows for the audit log CSV export (`crates/api`'s
+/// `GET /portfolios/:id/report.csv`).
+pub async fn list_rebalance_events(
+    pool: &PgPool,
+    portfolio_id: Uuid,
+) -> Result<Vec<RebalanceEvent>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT * FROM rebalance_events WHERE portfolio_id = $1 ORDER BY executed_at DESC",
+    )
+    .bind(portfolio_id)
+    .fetch_all(pool)
+    .await
+}
+
 /// Inserts a portfolio row on first sight of a vault address, or updates
 /// the mutable metadata (owner, name, threshold) on every call after -
 /// safe to call on every scheduler startup rather than needing a separate

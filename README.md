@@ -17,10 +17,7 @@ See [`../PROJECT.md`](../PROJECT.md) for the full project plan.
 | `crates/notify` | `rebalancer-notify` | HMAC-SHA256-signed webhook dispatch (`X-Rebalancer-Signature`, the Stripe/GitHub model). |
 | `crates/scheduler` | `rebalancer-scheduler` | Polls the vault for drift, computes and fee-gates rebalances, submits them, and dispatches notifications. The main service — see [Fee-aware execution](#fee-aware-execution) below. |
 | `crates/backtest` | `rebalancer-backtest` | Replays a strategy (threshold, calendar, or volatility-band) against historical daily prices, reusing `rebalancer-core`'s live decision logic, with FIFO cost-basis tracking. Ships as a CLI (`backtest`) pending the `api` crate. |
-
-`api` (an HTTP layer for the frontend, currently reading contracts
-directly) is a planned but not-yet-built crate — see
-[`../PROJECT.md`](../PROJECT.md).
+| `crates/api` | `rebalancer-api` | HTTP layer for the frontend, scoped to sub-portfolios + audit log export: registers a portfolio whose vault the frontend has already deployed/initialized/keeper-authorized (never touches the chain itself), lists a wallet's portfolios, and serves a CSV rebalance history export. The dashboard's live allocation/drift reads still go direct-to-contract — see [`../PROJECT.md`](../PROJECT.md). |
 
 ## Fee-aware execution
 
@@ -98,6 +95,17 @@ was never called for the vault. A totally empty (zero-balance) vault will
 show up as constantly "due" — a known on-chain quirk in
 `vault::needs_rebalance`, tracked in [`../PROJECT.md`](../PROJECT.md).
 
+### Running the API
+
+```sh
+cargo run -p rebalancer-api --bin rebalancer-api
+```
+
+Runs migrations on startup, then serves on `API_BIND_ADDR` (default
+`0.0.0.0:8080`). The frontend registers a portfolio only after deploying
+and initializing its vault and authorizing the shared keeper directly via
+the owner's wallet — this API never holds a key or touches the chain.
+
 ## Testing
 
 ```sh
@@ -125,7 +133,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | 2 | Pricing cross-check, circuit breaker, webhook notifications | Done — live-verified |
 | 3 | Backtesting engine, calendar/volatility-band strategies, cost-basis tracking | Done — live-verified over real historical data |
 | 4 | Fee-aware execution | Done — live-verified (real deposit, real deferral, real execution, real drift drop confirmed on-chain) |
-| 4 | Sub-portfolios, audit log export | Not started |
+| 4 | Sub-portfolios, audit log export | Backend done (`rebalancer-api`, integration-tested against real Postgres) — frontend integration not started |
 
 See [`../PROJECT.md`](../PROJECT.md) for the full build log and every
 live-network verification behind these results.
